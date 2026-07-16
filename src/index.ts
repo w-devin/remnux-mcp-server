@@ -47,6 +47,7 @@ import { handleGetOsintGuidance } from "./handlers/osint.js";
 import { handleCheckBehaviorPrerequisites } from "./handlers/check-behavior-prerequisites.js";
 import { handleVerifyStringUsage } from "./handlers/verify-string-usage.js";
 import { handleCompareFiles } from "./handlers/compare-files.js";
+import { z } from "zod";
 import { toolRegistry } from "./tools/registry.js";
 import { REPORT_TEMPLATE, GUIDELINES_DIGEST, ATTRIBUTION, SOURCE_META } from "./report/content.generated.js";
 import { OPTIONAL_SECTION_CONVENTION } from "./report/optional-sections.js";
@@ -570,49 +571,102 @@ export async function createServer(config: ServerConfig) {
     const modeLabel = config.idaBin ? `stdio (${config.idaBin})` : `HTTP (${config.idaEndpoint})`;
     try {
       const idaTools = await ida.listTools();
-      console.error(`IDA: connected via ${modeLabel}, registering ${idaTools.length} tools`);
+      console.error(`IDA: connected via ${modeLabel}, ${idaTools.length} tools available`);
 
-      for (const tool of idaTools) {
-        const prefixed = `ida_${tool.name}`;
-        const description =
-          (tool.description ?? tool.name) +
-          "\n\n[Proxied to IDA Pro via ida-mcp-rs]";
+      // ── ida_tool: execute any IDA tool by name (mirrors run_tool pattern) ──
+      server.tool(
+        "ida_tool",
+        "Execute an IDA Pro analysis tool by name via ida-mcp-rs. " +
+        "Use ida_tools_list to discover available tools and their parameters. " +
+        "Example: {\"name\": \"decompile\", \"arguments\": {\"addr\": \"0x401000\"}}",
+        {
+          name: z.string().describe("IDA tool name (e.g. 'decompile', 'list_functions', 'xrefs_to')"),
+          arguments: z.record(z.unknown()).optional().describe("Tool-specific parameters as key-value pairs"),
+        },
+        async (args) => {
+          const start = Date.now();
+          try {
+            const result = await ida.callTool(args.name, (args.arguments ?? {}) as Record<string, unknown>);
+            return {
+              content: result.content.map((c) => ({
+                type: "text" as const,
+                text: typeof c.text === "string" ? c.text : JSON.stringify(c),
+              })),
+              isError: result.isError,
+            };
+          } catch (err) {
+            return {
+              content: [{ type: "text" as const, text: JSON.stringify({
+                success: false,
+                tool: `ida_${args.name}`,
+                error: err instanceof Error ? err.message : String(err),
+                metadata: { elapsed_ms: Date.now() - start },
+              }, null, 2) }],
+              isError: true,
+            };
+          }
+        },
+      );
 
-        // Use a permissive schema; ida-mcp-rs validates parameters on its side.
-        server.tool(
-          prefixed,
-          description,
-          {},
-          async (args) => {
-            const start = Date.now();
-            try {
-              const result = await ida.callTool(tool.name, args as Record<string, unknown>);
-              return {
-                content: result.content.map((c) => ({
-                  type: "text" as const,
-                  text: typeof c.text === "string" ? c.text : JSON.stringify(c),
-                })),
-                isError: result.isError,
-              };
-            } catch (err) {
-              return {
-                content: [{ type: "text" as const, text: JSON.stringify({
-                  success: false,
-                  tool: prefixed,
-                  error: err instanceof Error ? err.message : String(err),
-                  metadata: { elapsed_ms: Date.now() - start },
-                }) }],
-                isError: true,
-              };
+      // ── ida_tools_list: discover available IDA tools ──
+      server.tool(
+        "ida_tools_list",
+        "List all available IDA Pro tools with descriptions and parameter schemas. " +
+        "Use this to discover what IDA tools are available before calling ida_tool. " +
+        "Pass a category to filter (e.g. 'functions', 'decompile', 'xrefs'). " +
+        "Pass a query to search tool names and descriptions.",
+        {
+          category: z.string().optional().describe(
+            "Filter by category: core, functions, disassembly, decompile, xrefs, " +
+            "controlflow, memory, search, metadata, types, editing, scripting"
+          ),
+          query: z.string().optional().describe("Search tools by name or description (substring match)"),
+        },
+        async (args) => {
+          const start = Date.now();
+          const tools = await ida.listTools();
+          let filtered = tools;
+
+          if (args.category) {
+            const catTools = IDA_TOOL_CATEGORIES[args.category.toLowerCase()];
+            if (catTools) {
+              filtered = filtered.filter((t) => catTools.includes(t.name));
             }
-          },
-        );
-      }
+          }
 
-      // Register an IDA-specific status tool
+          if (args.query) {
+            const q = args.query.toLowerCase();
+            filtered = filtered.filter((t) =>
+              t.name.includes(q) || (t.description ?? "").toLowerCase().includes(q)
+            );
+          }
+
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                tool: "ida_tools_list",
+                data: {
+                  total: filtered.length,
+                  tools: filtered.map((t) => ({
+                    name: t.name,
+                    description: t.description,
+                    parameters: t.inputSchema.properties ?? {},
+                    required: t.inputSchema.required ?? [],
+                  })),
+                },
+                metadata: { elapsed_ms: Date.now() - start },
+              }, null, 2),
+            }],
+          };
+        },
+      );
+
+      // ── ida_status: connection health check ──
       server.tool(
         "ida_status",
-        "Check the connection status to ida-mcp-rs and list available IDA tools.",
+        "Check the connection status to ida-mcp-rs and show summary info.",
         {},
         async () => {
           const tools = await ida.listTools();
@@ -627,7 +681,12 @@ export async function createServer(config: ServerConfig) {
                   mode: config.idaBin ? "stdio" : "http",
                   endpoint: config.idaBin ?? config.idaEndpoint,
                   tool_count: tools.length,
-                  tools: tools.map((t) => t.name),
+                  categories: Object.fromEntries(
+                    Object.entries(IDA_TOOL_CATEGORIES).map(([cat, names]) => [
+                      cat,
+                      names.filter((n) => tools.some((t) => t.name === n)).length,
+                    ]).filter(([, count]) => (count as number) > 0)
+                  ) as Record<string, number>,
                 },
                 metadata: { elapsed_ms: 0 },
               }, null, 2),
