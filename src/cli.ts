@@ -205,6 +205,14 @@ OPTIONS:
   --http-token <token>    Bearer token for HTTP auth (also reads MCP_TOKEN env var)
   --insecure-no-auth      Allow a non-loopback HTTP bind with no token (NOT recommended).
                           The server otherwise refuses to start in that configuration
+
+PROXY MODE (for Claude Desktop):
+  When the REMNUX_URL environment variable is set, the server runs as a stdio-to-HTTP
+  bridge (proxy mode) instead of a normal MCP server. This allows Claude Desktop —
+  which only supports stdio MCP — to connect to a remote remnux-mcp-server.
+
+  REMNUX_URL=<url>        Remote MCP endpoint (e.g. http://192.168.5.102:5555/mcp)
+  REMNUX_TOKEN=<token>    Bearer token for authentication
   --ida-endpoint <url>    Connect to an ida-mcp-rs instance at this HTTP endpoint
                           (e.g. http://127.0.0.1:8765). When set, IDA Pro analysis
                           tools are automatically registered with the ida_ prefix
@@ -247,13 +255,31 @@ EXAMPLES:
   # Expose only core + functions IDA tools
   npx @remnux/mcp-server --ida-bin=/usr/local/bin/ida-mcp --ida-toolsets=core,functions
 
+  # Proxy mode for Claude Desktop (connects to remote remnux-mcp-server via HTTP)
+  REMNUX_URL=http://192.168.5.102:5555/mcp REMNUX_TOKEN=secret npx @remnux/mcp-server
+
 Built-in tool guidance: suggest_tools, get_tool_help, analyze_file
 Optional docs MCP: https://docs.remnux.org/~gitbook/mcp
 `);
 }
 
-// Start server
-startServer(parseArgs()).catch((error) => {
-  console.error("Failed to start server:", error);
-  process.exit(1);
-});
+// ── Proxy mode: bridge stdio ↔ HTTP when REMNUX_URL is set ───────────────────
+// For Claude Desktop, which only supports stdio MCP servers.
+// Launches a local stdio MCP server that proxies all tool calls to a
+// remote remnux-mcp-server over Streamable HTTP.
+if (process.env.REMNUX_URL) {
+  const { startProxy } = await import("./proxy.js");
+  startProxy({
+    url: process.env.REMNUX_URL,
+    token: process.env.REMNUX_TOKEN,
+  }).catch((error) => {
+    console.error("Failed to start proxy:", error);
+    process.exit(1);
+  });
+} else {
+  // Normal server mode
+  startServer(parseArgs()).catch((error) => {
+    console.error("Failed to start server:", error);
+    process.exit(1);
+  });
+}

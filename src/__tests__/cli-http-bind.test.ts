@@ -18,8 +18,8 @@ const here = dirname(fileURLToPath(import.meta.url));
 const CLI = resolve(here, "../../dist/cli.js");
 const hasBuild = existsSync(CLI);
 
-// Empty MCP_TOKEN so a token in the ambient env can never leak into these cases.
-const BASE_ENV = { ...process.env, MCP_TOKEN: "" };
+// Empty MCP_TOKEN/REMNUX_URL so values in the ambient env never leak into these cases.
+const BASE_ENV = { ...process.env, MCP_TOKEN: "", REMNUX_URL: "", REMNUX_TOKEN: "" };
 
 /**
  * Spawn the CLI and resolve true if it is still running after a grace period
