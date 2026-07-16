@@ -14,6 +14,9 @@ import { readFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
+// Bun compiles JSON imports directly into the bundle — used as fallback in compiled binaries.
+import bundledOsintCatalog from "../../data/osint-resources.json" with { type: "json" };
+
 export type AccessTier = "free" | "free_account" | "freemium" | "paid";
 export type DisclosurePosture = "none" | "vendor" | "public";
 export type IocType = "hash" | "url" | "domain" | "ip" | "family" | "host_artifact";
@@ -56,6 +59,11 @@ export interface CondensedResource {
   best_use: string;
 }
 
+/** Detect if running as a Bun-compiled single-file binary. */
+function isBunCompiledBinary(): boolean {
+  return typeof process.argv[0] === "string" && process.argv[0].includes("/$bunfs/");
+}
+
 /** Absolute path to the bundled catalog (data/ is two levels up from dist/osint/ or src/osint/). */
 export function resolveCatalogPath(): string {
   const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -64,6 +72,9 @@ export function resolveCatalogPath(): string {
 
 /** Load and parse the catalog, throwing on any error. Used by the CI integrity test. */
 export function loadOsintCatalogStrict(): OsintCatalog {
+  if (isBunCompiledBinary()) {
+    return bundledOsintCatalog as unknown as OsintCatalog;
+  }
   const raw = readFileSync(resolveCatalogPath(), "utf-8");
   return JSON.parse(raw) as OsintCatalog;
 }

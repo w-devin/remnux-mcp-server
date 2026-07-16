@@ -96,7 +96,7 @@ let closeTransports: () => Promise<void>;
 beforeAll(async () => {
   // Import after mocks are registered
   const { createServer } = await import("../index.js");
-  const server = await createServer(testConfig);
+  const { server } = await createServer(testConfig);
 
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 

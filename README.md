@@ -9,6 +9,7 @@ This server enables AI assistants (Claude Code, OpenCode, Cursor, etc.) to execu
 1. **AI tool on your machine, REMnux as Docker/VM** — MCP server runs on your machine, reaches into REMnux over Docker exec or SSH
 2. **AI tool and MCP server both on REMnux** — everything runs locally on the same REMnux system (simplest setup)
 3. **AI tool on your machine, MCP server on REMnux** — MCP server runs inside REMnux, your AI tool connects over HTTP
+4. **With IDA Pro integration** — optionally connect to an [ida-mcp-rs](https://github.com/blacktop/ida-mcp-rs) instance to expose IDA Pro reverse engineering tools alongside REMnux tools through a single endpoint
 
 Beyond raw command execution, the server encodes malware analysis domain expertise:
 
@@ -100,6 +101,41 @@ The MCP server runs inside the REMnux VM or container using the Local connector.
                                        |  REMnux tools (native)       |
                                        +------------------------------+
 ```
+
+### Scenario 4: With IDA Pro Integration
+
+When both REMnux analysis tools and IDA Pro reverse engineering capabilities are needed, this server can connect to an [ida-mcp-rs](https://github.com/blacktop/ida-mcp-rs) instance as an MCP client. All tools — REMnux and IDA — are served through a single MCP endpoint, so the AI assistant needs only one connection.
+
+```
++----------------+                         +----------------------------------------+
+|  AI Assistant  |----MCP (stdio/HTTP)---->|  remnux-mcp-server                     |
+| (Claude Code,  |                         |                                        |
+|  Cursor, etc)  |<---- single endpoint ---|  REMnux tools (16):                    |
++----------------+                         |    analyze_file, run_tool, ...         |
+                                           |                                        |
+                                           |  IDA tools (71, ida_ prefix):          |
+                                           |    ida_open_idb, ida_decompile,        |
+                                           |    ida_list_functions, ida_xrefs_to,   |
+                                           |    ida_disasm, ida_find_bytes, ...     |
+                                           |                                        |
+                                           |  + ida_status (connection health)      |
+                                           +----------------|------------------------+
+                                                            | MCP (stdio or HTTP)
+                                                            v
+                                                  +---------------------+
+                                                  |  ida-mcp-rs         |
+                                                  |  (child process or  |
+                                                  |   separate host)    |
+                                                  +---------------------+
+                                                            |
+                                                            v
+                                                  +---------------------+
+                                                  |  IDA Pro SDK        |
+                                                  |  (idalib)           |
+                                                  +---------------------+
+```
+
+Stdio mode (recommended): remnux-mcp-server spawns ida-mcp-rs as a child process — no extra ports, no separate process to manage. HTTP mode: connects to a separately running ida-mcp-rs instance, which can be on the same or a different host.
 
 ## Quick Start
 
@@ -227,6 +263,86 @@ claude mcp add remnux --transport http http://REMNUX_IP:3000/mcp \
 - **For HTTPS**, place a reverse proxy (nginx, caddy) in front of the MCP server. The bearer token travels in plaintext over HTTP without this.
 - **DNS rebinding protection** is automatically enabled when binding to localhost.
 
+### Scenario 4: With IDA Pro Integration
+
+Connect to [ida-mcp-rs](https://github.com/blacktop/ida-mcp-rs) to expose IDA Pro reverse engineering tools alongside REMnux tools through a single MCP endpoint. The AI assistant connects only to remnux-mcp-server — it doesn't need to know about ida-mcp-rs.
+
+**Two connection modes:**
+
+| Mode | Flag | How it works | When to use |
+|------|------|-------------|-------------|
+| **Stdio** (recommended) | `--ida-bin=<path>` | remnux-mcp-server spawns ida-mcp-rs as a child process, communicates over stdin/stdout. Auto-started on first tool call, killed on server shutdown. | ida-mcp-rs is installed on the same machine |
+| **HTTP** | `--ida-endpoint=<url>` | Connects to an already-running ida-mcp-rs instance via Streamable HTTP. | ida-mcp-rs runs on a different host, or you want to share it with other clients |
+
+**Prerequisites:**
+- [ida-mcp-rs](https://github.com/blacktop/ida-mcp-rs) binary installed (requires IDA SDK / idalib at build time)
+- IDA Pro libraries accessible at runtime (set `IDADIR` or ensure they're on the library path)
+
+```bash
+# Stdio mode — simplest setup, auto-spawns ida-mcp-rs
+npx @remnux/mcp-server --ida-bin=/usr/local/bin/ida-mcp
+
+# Stdio mode with extra ida-mcp-rs flags
+npx @remnux/mcp-server --ida-bin=/usr/local/bin/ida-mcp \
+  --ida-bin-args="--read-only"
+
+# Stdio mode in Docker (ida-mcp-rs binary inside the container)
+npx @remnux/mcp-server --mode=docker --container=remnux \
+  --ida-bin=/usr/local/bin/ida-mcp
+
+# HTTP mode — connect to a separately running ida-mcp-rs
+npx @remnux/mcp-server --ida-endpoint=http://IDA_HOST:8765
+
+# HTTP mode with authentication
+npx @remnux/mcp-server --ida-endpoint=http://IDA_HOST:8765 \
+  --ida-token=IDA_SECRET
+```
+
+When `--ida-bin` is set, ida-mcp-rs is spawned in its default stdio mode — no HTTP port needed, no separate process to manage. The child process inherits the parent's environment, so `IDADIR`, `DYLD_LIBRARY_PATH`, and `LD_LIBRARY_PATH` are passed through automatically.
+
+**Filtering IDA tools:**
+
+By default all 71 IDA tools are exposed. Use `--ida-toolsets` to expose only specific categories:
+
+```bash
+npx @remnux/mcp-server --ida-bin=/usr/local/bin/ida-mcp \
+  --ida-toolsets=core,functions,disasm,decompile
+```
+
+Available toolsets: `core`, `functions`, `disassembly`, `decompile`, `xrefs`, `controlflow`, `memory`, `search`, `metadata`, `types`, `editing`, `scripting`.
+
+Use `--ida-exclude-tools` to remove specific tools:
+
+```bash
+npx @remnux/mcp-server --ida-bin=/usr/local/bin/ida-mcp \
+  --ida-exclude-tools=patch,patch_asm,rename,run_script
+```
+
+**Claude Desktop / Cursor config (Scenario 4):**
+
+```json
+{
+  "mcpServers": {
+    "remnux": {
+      "command": "npx",
+      "args": [
+        "@remnux/mcp-server",
+        "--ida-bin=/usr/local/bin/ida-mcp"
+      ]
+    }
+  }
+}
+```
+
+#### Notes on IDA Integration
+
+- **Stdio mode manages the child lifecycle.** The ida-mcp-rs process is spawned lazily (on first `ida_*` tool call) and killed when the server shuts down. No separate process management needed.
+- **HTTP mode requires a running instance.** If ida-mcp-rs is not reachable at startup, a warning is logged and REMnux tools still work normally. IDA tools become available once ida-mcp-rs starts.
+- **ida-mcp-rs must have IDA Pro / idalib.** It links against IDA's headless SDK at build time and loads IDA libraries at runtime. See [ida-mcp-rs building docs](https://github.com/blacktop/ida-mcp-rs/blob/main/docs/BUILDING.md).
+- **Timeout coordination.** The `--ida-timeout` flag (default 300s) controls per-tool-call timeouts to ida-mcp-rs. Set it higher than the longest expected IDA operation (e.g., decompiling a large binary).
+- **Tool descriptions are from ida-mcp-rs.** The `ida_*` tools carry their original descriptions from ida-mcp-rs, prefixed with `[Proxied to IDA Pro via ida-mcp-rs]`. Use `ida_tool_catalog` or `ida_tool_help` for detailed docs.
+- **No changes to ida-mcp-rs needed.** This integration uses ida-mcp-rs's standard MCP interface (stdio or HTTP) — no patches or forks required.
+
 ## CLI Options
 
 | Flag | Description | Default |
@@ -247,6 +363,13 @@ claude mcp add remnux --transport http http://REMNUX_IP:3000/mcp \
 | `--http-host` | HTTP bind address (for http transport) | `127.0.0.1` |
 | `--http-token` | Bearer token for HTTP auth (also reads `MCP_TOKEN` env var) | - |
 | `--insecure-no-auth` | Allow a non-loopback HTTP bind without a token (the server otherwise refuses). NOT recommended | off |
+| `--ida-endpoint` | Connect to an ida-mcp-rs instance at this HTTP endpoint (e.g. `http://127.0.0.1:8765`). When set, IDA tools are registered with `ida_` prefix | - |
+| `--ida-bin` | Path to ida-mcp-rs binary. Spawns it as a child process via stdio (auto-started, auto-killed). Takes precedence over `--ida-endpoint` if both set | - |
+| `--ida-bin-args` | Comma-separated extra arguments for the ida-mcp-rs binary (e.g. `--read-only`) | - |
+| `--ida-token` | Bearer token for ida-mcp-rs HTTP auth (also reads `IDA_MCP_TOKEN` env var) | - |
+| `--ida-timeout` | Per-IDA-tool-call timeout in seconds | `300` |
+| `--ida-toolsets` | Comma-separated IDA toolset categories to expose (e.g. `core,functions,disasm`). Omit to expose all | all |
+| `--ida-exclude-tools` | Comma-separated IDA tool names to exclude from exposure | - |
 
 ## MCP Tools
 
@@ -270,6 +393,26 @@ claude mcp add remnux --transport http http://REMNUX_IP:3000/mcp \
 | `get_report_template` | Return a bundled malware analysis report template (CC BY 4.0, by Lenny Zeltser) for drafting a report offline. The response also carries an `optional_section_convention` explaining that headings marked `(Optional)` are conditional markers to resolve, not literal heading text |
 | `get_report_guidance` | Return bundled report writing guidelines (sections, confidence, capabilities, IOC tiering, anti-patterns); `topic` narrows the digest, or `topic='triage_checklist'` returns the pre-claim artifact-vs-behavior triage discipline checklist |
 | `get_osint_guidance` | Return bundled, offline OSINT triage guidance for malware indicators. Enrichment tradecraft (hash-first, disclosure-aware, do-not-tip-off-the-adversary, leads-not-verdicts) plus a curated, PR-maintained catalog of free and freemium lookup services. `topic` selects the guidance slice, `ioc_type` narrows the catalog. Makes no network calls and holds no API keys |
+
+### IDA Pro Tools (when `--ida-endpoint` is set)
+
+When connected to an ida-mcp-rs instance, the following IDA tools are automatically registered with the `ida_` prefix. They proxy to ida-mcp-rs over MCP HTTP — no IDA-specific code runs inside remnux-mcp-server.
+
+| Category | `ida_*` Tools | Description |
+|----------|---------------|-------------|
+| **core** | `open_idb`, `open_dsc`, `close_idb`, `load_debug_info`, `analysis_status`, `idb_meta`, `tool_catalog`, `tool_help`, `recent_operations`, `task_status` | Database lifecycle, discovery, and meta-tools |
+| **functions** | `list_functions`, `resolve_function`, `function_at`, `lookup_funcs`, `analyze_funcs` | Function navigation and discovery |
+| **disassembly** | `disasm`, `disasm_by_name`, `disasm_function_at` | Disassembly listing |
+| **decompile** | `decompile`, `pseudocode_at` | Hex-Rays decompilation (requires Hex-Rays license) |
+| **xrefs** | `xrefs_to`, `xrefs_from`, `xrefs_to_string`, `xref_matrix`, `xrefs_to_field` | Cross-reference analysis |
+| **control flow** | `basic_blocks`, `callers`, `callees`, `callgraph`, `find_paths` | CFG and call graph analysis |
+| **memory** | `get_bytes`, `get_string`, `get_u8/u16/u32/u64`, `get_global_value`, `int_convert` | Memory and data reading |
+| **search** | `find_bytes`, `search`, `strings`, `find_string`, `analyze_strings`, `find_insns`, `find_insn_operands` | Pattern and string search |
+| **metadata** | `segments`, `addr_info`, `imports`, `exports`, `export_funcs`, `entrypoints`, `list_globals` | Binary structure info |
+| **types** | `local_types`, `declare_type`, `apply_types`, `infer_types`, `stack_frame`, `structs`, `struct_info`, `read_struct`, `search_structs` | Type system and structs |
+| **editing** | `set_comments`, `patch_asm`, `patch`, `rename` | Database mutation |
+| **scripting** | `run_script` | IDAPython execution |
+| **meta** | `ida_status` | Connection health and tool listing (added by remnux-mcp-server) |
 
 ### Key Behaviors
 
@@ -527,6 +670,7 @@ The service catalog lives in `data/osint-resources.json`, a contributor-editable
 
 - [REMnux](https://remnux.org) - Linux toolkit for malware analysis
 - [REMnux salt-states](https://github.com/REMnux/salt-states) - Tool definitions and installation
+- [ida-mcp-rs](https://github.com/blacktop/ida-mcp-rs) - Headless IDA Pro MCP server (used by `--ida-endpoint`)
 - [Using AI Agents to Analyze Malware on REMnux](https://zeltser.com/ai-malware-analysis-remnux) - Walkthrough of AI-assisted malware analysis using this MCP server
 
 ## License

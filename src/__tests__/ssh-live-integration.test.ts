@@ -55,7 +55,7 @@ describe.skipIf(!runLive)("SSH live integration", () => {
     };
 
     const { createServer } = await import("../index.js");
-    const server = await createServer(config);
+    const { server } = await createServer(config);
 
     const [clientTransport, serverTransport] =
       InMemoryTransport.createLinkedPair();

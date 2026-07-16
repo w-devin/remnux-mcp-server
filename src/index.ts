@@ -51,6 +51,23 @@ import { toolRegistry } from "./tools/registry.js";
 import { REPORT_TEMPLATE, GUIDELINES_DIGEST, ATTRIBUTION, SOURCE_META } from "./report/content.generated.js";
 import { OPTIONAL_SECTION_CONVENTION } from "./report/optional-sections.js";
 import { httpBindRequiresToken } from "./utils/loopback.js";
+import { IdaConnector } from "./connectors/ida.js";
+
+/** ida-mcp-rs tool category → tool name list (for --ida-toolsets filtering) */
+const IDA_TOOL_CATEGORIES: Record<string, string[]> = {
+  core: ["open_idb", "open_dsc", "dsc_add_dylib", "dsc_add_region", "load_debug_info", "analysis_status", "close_idb", "tool_catalog", "tool_help", "recent_operations", "task_status", "idb_meta"],
+  functions: ["list_functions", "list_funcs", "resolve_function", "function_at", "lookup_funcs", "analyze_funcs"],
+  disassembly: ["disasm", "disasm_by_name", "disasm_function_at"],
+  decompile: ["decompile", "pseudocode_at"],
+  xrefs: ["xrefs_to", "xrefs_from", "xrefs_to_string", "xref_matrix", "xrefs_to_field"],
+  controlflow: ["basic_blocks", "callers", "callees", "callgraph", "find_paths"],
+  memory: ["get_bytes", "get_string", "get_u8", "get_u16", "get_u32", "get_u64", "get_global_value", "int_convert"],
+  search: ["find_bytes", "search", "strings", "find_string", "analyze_strings", "find_insns", "find_insn_operands"],
+  metadata: ["segments", "addr_info", "imports", "exports", "export_funcs", "entrypoints", "list_globals"],
+  types: ["local_types", "declare_type", "apply_types", "infer_types", "stack_frame", "declare_stack", "delete_stack", "structs", "struct_info", "read_struct", "search_structs"],
+  editing: ["set_comments", "patch_asm", "patch", "rename"],
+  scripting: ["run_script"],
+};
 
 export interface ServerConfig extends ConnectorConfig {
   samplesDir: string;
@@ -63,11 +80,32 @@ export interface ServerConfig extends ConnectorConfig {
   httpHost?: string;
   httpToken?: string;
   allowInsecureNoAuth?: boolean;
+  /** Path to ida-mcp-rs binary (stdio mode — auto-spawns child process) */
+  idaBin?: string;
+  /** Extra args passed to the ida-mcp-rs binary (e.g. ["--read-only"]) */
+  idaBinArgs?: string[];
+  /** ida-mcp-rs HTTP endpoint, e.g. "http://127.0.0.1:8765" */
+  idaEndpoint?: string;
+  /** Bearer token for ida-mcp-rs HTTP auth */
+  idaToken?: string;
+  /** Per-IDA-tool-call timeout in seconds (default: 300) */
+  idaTimeout?: number;
+  /** Comma-separated toolsets to expose (e.g. "core,functions,disasm") */
+  idaToolsets?: string;
+  /** Comma-separated tool names to exclude */
+  idaExcludeTools?: string;
 }
 
 export async function createServer(config: ServerConfig) {
   const _require = createRequire(import.meta.url);
-  const { version: pkgVersion } = _require("../package.json") as { version: string };
+  // In a Bun-compiled binary, __PACKAGE_VERSION__ is injected at compile time via --define.
+  // In normal Node.js mode, read from package.json.
+  let pkgVersion: string;
+  if (typeof globalThis.__PACKAGE_VERSION__ === "string") {
+    pkgVersion = globalThis.__PACKAGE_VERSION__;
+  } else {
+    pkgVersion = (_require("../package.json") as { version: string }).version;
+  }
   const server = new McpServer(
     {
       name: "remnux-mcp-server",
@@ -499,7 +537,117 @@ export async function createServer(config: ServerConfig) {
     }),
   );
 
-  return server;
+  // ── IDA Pro integration (optional) ─────────────────────────────────────────
+  // When --ida-endpoint is set, connect to ida-mcp-rs and register its tools
+  // with the ida_ prefix so a single MCP endpoint serves both REMnux and IDA.
+
+  if (config.idaBin || config.idaEndpoint) {
+    const includeTools = new Set<string>();
+    if (config.idaToolsets) {
+      for (const cat of config.idaToolsets.split(",").map((s) => s.trim().toLowerCase())) {
+        const names = IDA_TOOL_CATEGORIES[cat];
+        if (names) {
+          for (const n of names) includeTools.add(n);
+        } else {
+          console.error(`WARNING: unknown IDA toolset '${cat}' (known: ${Object.keys(IDA_TOOL_CATEGORIES).join(", ")})`);
+        }
+      }
+    }
+    const excludeTools = new Set<string>(
+      config.idaExcludeTools ? config.idaExcludeTools.split(",").map((s) => s.trim()) : [],
+    );
+
+    const ida = new IdaConnector({
+      bin: config.idaBin,
+      binArgs: config.idaBinArgs,
+      endpoint: config.idaEndpoint,
+      token: config.idaToken,
+      timeout: (config.idaTimeout ?? 300) * 1000,
+      includeTools: includeTools.size ? includeTools : undefined,
+      excludeTools: excludeTools.size ? excludeTools : undefined,
+    });
+
+    const modeLabel = config.idaBin ? `stdio (${config.idaBin})` : `HTTP (${config.idaEndpoint})`;
+    try {
+      const idaTools = await ida.listTools();
+      console.error(`IDA: connected via ${modeLabel}, registering ${idaTools.length} tools`);
+
+      for (const tool of idaTools) {
+        const prefixed = `ida_${tool.name}`;
+        const description =
+          (tool.description ?? tool.name) +
+          "\n\n[Proxied to IDA Pro via ida-mcp-rs]";
+
+        // Use a permissive schema; ida-mcp-rs validates parameters on its side.
+        server.tool(
+          prefixed,
+          description,
+          {},
+          async (args) => {
+            const start = Date.now();
+            try {
+              const result = await ida.callTool(tool.name, args as Record<string, unknown>);
+              return {
+                content: result.content.map((c) => ({
+                  type: "text" as const,
+                  text: typeof c.text === "string" ? c.text : JSON.stringify(c),
+                })),
+                isError: result.isError,
+              };
+            } catch (err) {
+              return {
+                content: [{ type: "text" as const, text: JSON.stringify({
+                  success: false,
+                  tool: prefixed,
+                  error: err instanceof Error ? err.message : String(err),
+                  metadata: { elapsed_ms: Date.now() - start },
+                }) }],
+                isError: true,
+              };
+            }
+          },
+        );
+      }
+
+      // Register an IDA-specific status tool
+      server.tool(
+        "ida_status",
+        "Check the connection status to ida-mcp-rs and list available IDA tools.",
+        {},
+        async () => {
+          const tools = await ida.listTools();
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                success: true,
+                tool: "ida_status",
+                data: {
+                  connected: true,
+                  mode: config.idaBin ? "stdio" : "http",
+                  endpoint: config.idaBin ?? config.idaEndpoint,
+                  tool_count: tools.length,
+                  tools: tools.map((t) => t.name),
+                },
+                metadata: { elapsed_ms: 0 },
+              }, null, 2),
+            }],
+          };
+        },
+      );
+    } catch (err) {
+      console.error(
+        `WARNING: failed to connect to ida-mcp-rs via ${modeLabel}: ${err instanceof Error ? err.message : err}\n` +
+        (config.idaBin
+          ? "IDA tools will not be available. Ensure the binary path is correct and ida-mcp-rs can find IDA libraries."
+          : "IDA tools will not be available. Ensure ida-mcp-rs is running with serve-http.")
+      );
+    }
+
+    return { server, idaConnector: ida };
+  }
+
+  return { server };
 }
 
 export async function startServer(config: ServerConfig) {
@@ -520,11 +668,14 @@ export async function startServer(config: ServerConfig) {
   if (transportMode === "http") {
     await startHttpServer(config);
   } else {
-    const server = await createServer(config);
+    const { server, idaConnector } = await createServer(config);
     const transport = new StdioServerTransport();
     await server.connect(transport);
 
     const shutdown = async () => {
+      try {
+        await idaConnector?.disconnect();
+      } catch { /* best effort */ }
       try {
         await server.close();
       } catch { /* best effort */ }
@@ -634,7 +785,7 @@ async function startHttpServer(config: ServerConfig) {
         }
       };
 
-      const server = await createServer(config);
+      const { server } = await createServer(config);
       await server.connect(transport);
 
       await transport.handleRequest(req, res, req.body);

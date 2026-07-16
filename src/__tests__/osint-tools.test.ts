@@ -45,7 +45,7 @@ let closeTransports: () => Promise<void>;
 
 beforeAll(async () => {
   const { createServer } = await import("../index.js");
-  const server = await createServer(testConfig);
+  const { server } = await createServer(testConfig);
 
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);

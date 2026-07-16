@@ -4,7 +4,13 @@ import { startServer, type ServerConfig } from "./index.js";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
-const { version } = require("../package.json") as { version: string };
+// In a Bun-compiled binary, __PACKAGE_VERSION__ is injected at compile time via --define.
+let version: string;
+if (typeof globalThis.__PACKAGE_VERSION__ === "string") {
+  version = globalThis.__PACKAGE_VERSION__;
+} else {
+  version = (require("../package.json") as { version: string }).version;
+}
 
 function parseIntOrExit(value: string, flag: string): number {
   const n = parseInt(value, 10);
@@ -115,6 +121,35 @@ function parseArgs(): ServerConfig {
       case "--insecure-no-auth":
         config.allowInsecureNoAuth = true;
         break;
+      case "--ida-endpoint":
+        config.idaEndpoint = value;
+        consumeValue();
+        break;
+      case "--ida-bin":
+        config.idaBin = value;
+        consumeValue();
+        break;
+      case "--ida-bin-args":
+        // Comma-separated extra args for ida-mcp-rs binary
+        config.idaBinArgs = value.split(",").map((s) => s.trim()).filter(Boolean);
+        consumeValue();
+        break;
+      case "--ida-token":
+        config.idaToken = value;
+        consumeValue();
+        break;
+      case "--ida-timeout":
+        config.idaTimeout = parseIntOrExit(value, "--ida-timeout");
+        consumeValue();
+        break;
+      case "--ida-toolsets":
+        config.idaToolsets = value;
+        consumeValue();
+        break;
+      case "--ida-exclude-tools":
+        config.idaExcludeTools = value;
+        consumeValue();
+        break;
       case "--help":
       case "-h":
         printHelp();
@@ -134,6 +169,9 @@ function parseArgs(): ServerConfig {
   // Read token from env var if not set via CLI
   if (!config.httpToken && process.env.MCP_TOKEN) {
     config.httpToken = process.env.MCP_TOKEN;
+  }
+  if (!config.idaToken && process.env.IDA_MCP_TOKEN) {
+    config.idaToken = process.env.IDA_MCP_TOKEN;
   }
 
   return config;
@@ -167,6 +205,20 @@ OPTIONS:
   --http-token <token>    Bearer token for HTTP auth (also reads MCP_TOKEN env var)
   --insecure-no-auth      Allow a non-loopback HTTP bind with no token (NOT recommended).
                           The server otherwise refuses to start in that configuration
+  --ida-endpoint <url>    Connect to an ida-mcp-rs instance at this HTTP endpoint
+                          (e.g. http://127.0.0.1:8765). When set, IDA Pro analysis
+                          tools are automatically registered with the ida_ prefix
+  --ida-bin <path>        Path to ida-mcp-rs binary. Spawns it as a child process
+                          using stdio transport (auto-started on first tool call,
+                          killed on server shutdown). Mutually exclusive with
+                          --ida-endpoint; if both are set, --ida-bin takes precedence
+  --ida-bin-args <args>   Comma-separated extra arguments for the ida-mcp-rs binary
+                          (e.g. "--read-only,--log-level,debug")
+  --ida-token <token>     Bearer token for ida-mcp-rs HTTP auth (also reads IDA_MCP_TOKEN env var)
+  --ida-timeout <secs>    Per-IDA-tool-call timeout (default: 300)
+  --ida-toolsets <sets>   Comma-separated IDA toolset categories to expose
+                          (e.g. core,functions,disasm,xrefs). Omit to expose all
+  --ida-exclude-tools <t> Comma-separated IDA tool names to exclude from exposure
   -h, --help              Show this help message
   -v, --version           Show version
 
@@ -185,6 +237,15 @@ EXAMPLES:
 
   # Add to Claude Code (stdio)
   claude mcp add remnux -- npx @remnux/mcp-server
+
+  # With IDA Pro integration (auto-spawn ida-mcp-rs via stdio)
+  npx @remnux/mcp-server --ida-bin=/usr/local/bin/ida-mcp
+
+  # With IDA Pro integration (connect to running ida-mcp-rs via HTTP)
+  npx @remnux/mcp-server --ida-endpoint=http://127.0.0.1:8765
+
+  # Expose only core + functions IDA tools
+  npx @remnux/mcp-server --ida-bin=/usr/local/bin/ida-mcp --ida-toolsets=core,functions
 
 Built-in tool guidance: suggest_tools, get_tool_help, analyze_file
 Optional docs MCP: https://docs.remnux.org/~gitbook/mcp

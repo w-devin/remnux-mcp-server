@@ -9,6 +9,10 @@ import { readFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
+// Bun compiles JSON imports directly into the bundle, so these work in
+// standalone binaries.  In normal Node.js mode they are regular imports.
+import bundledToolsIndex from "../../data/tools-index.json" with { type: "json" };
+
 export interface CatalogTool {
   command: string;
   name: string;
@@ -142,8 +146,18 @@ class ToolCatalog {
   }
 }
 
+/** Detect if running as a Bun-compiled single-file binary. */
+function isBunCompiledBinary(): boolean {
+  return typeof process.argv[0] === "string" && process.argv[0].includes("/$bunfs/");
+}
+
 /** Load the bundled tools-index.json. */
 function loadIndex(): ToolsIndex {
+  // In a Bun-compiled binary the JSON is inlined into the bundle via import.
+  if (isBunCompiledBinary()) {
+    return bundledToolsIndex as unknown as ToolsIndex;
+  }
+
   const __dirname = dirname(fileURLToPath(import.meta.url));
   // data/ is at package root, two levels up from dist/catalog/ or src/catalog/
   const indexPath = resolve(__dirname, "../../data/tools-index.json");

@@ -71,7 +71,7 @@ function createTestApp(options: { token?: string } = {}) {
       if (transport.sessionId) sessions.delete(transport.sessionId);
     };
 
-    const server = await createServer(config);
+    const { server } = await createServer(config);
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
 
