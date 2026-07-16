@@ -6,10 +6,11 @@
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "remnux-mcp-server": "dist/cli.js"
+    "remnux-mcp-server": "dist/cli.js",
+    "remnux-mcp-proxy": "dist/proxy.mjs"
   },
   "scripts": {
-    "build": "tsc && cp -r src/config dist/ && chmod +x dist/cli.js",
+    "build": "tsc && cp -r src/config dist/ && cp proxy.mjs dist/ && chmod +x dist/cli.js dist/proxy.mjs",
     "dev": "tsc --watch",
     "start": "node dist/cli.js",
     "lint": "eslint src/",
