@@ -18,7 +18,7 @@
     "validate:tools": "pnpm exec tsx scripts/validate-tools.ts",
     "sync:report-guidance": "pnpm exec tsx scripts/sync-report-guidance.ts",
     "preversion": "pnpm run validate:tools && pnpm test",
-    "prepare": "husky",
+    "prepare": "husky || true && npm run build",
     "prepublishOnly": "pnpm run build"
   },
   "keywords": [
