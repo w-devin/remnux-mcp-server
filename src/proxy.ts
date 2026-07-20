@@ -6,10 +6,15 @@
  * is called from cli.ts when REMNUX_URL is set.
  */
 
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import {
+  ListToolsRequestSchema,
+  CallToolRequestSchema,
+  type CallToolResult,
+} from "@modelcontextprotocol/sdk/types.js";
 
 export interface ProxyConfig {
   url: string;
@@ -43,9 +48,14 @@ export async function startProxy(config: ProxyConfig): Promise<void> {
   const { tools: remoteTools } = await remoteClient.listTools();
   console.error(`Discovered ${remoteTools.length} remote tools.`);
 
-  // ── Create local MCP server (stdio) ──────────────────────────────────────
+  // ── Create local MCP server (stdio), low-level so we can forward the ──────
+  //    remote's raw JSON Schemas verbatim. The high-level McpServer.tool()
+  //    requires Zod shapes and rejects the remote's native JSON Schema
+  //    properties (e.g. the `run_tool` tool), throwing:
+  //    "expected a Zod schema or ToolAnnotations, but received an unrecognized
+  //    object".
 
-  const server = new McpServer(
+  const server = new Server(
     { name: "remnux-mcp-proxy", version: "1.0.0" },
     {
       capabilities: { tools: {} },
@@ -55,48 +65,36 @@ export async function startProxy(config: ProxyConfig): Promise<void> {
     },
   );
 
-  // Register each remote tool locally
-  for (const tool of remoteTools) {
-    server.tool(
-      tool.name,
-      tool.description ?? tool.name,
-      tool.inputSchema.properties ?? {},
-      async (args) => {
-        try {
-          const result = await remoteClient.callTool({
-            name: tool.name,
-            arguments: args,
-          }) as { content?: Array<{ type: string; text?: string }>; isError?: boolean; toolResult?: unknown };
+  // Forward the remote tool list verbatim, preserving each tool's inputSchema,
+  // annotations, and outputSchema without Zod reinterpretation.
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: remoteTools,
+  }));
 
-          if (result.content) {
-            return {
-              content: result.content.map((c: { type: string; text?: string }) => ({
-                type: "text" as const,
-                text: typeof c.text === "string" ? c.text : JSON.stringify(c),
-              })),
-              isError: result.isError ?? false,
-            };
-          }
-          return {
-            content: [{ type: "text" as const, text: JSON.stringify(result.toolResult ?? result) }],
-            isError: false,
-          };
-        } catch (err) {
-          return {
-            content: [{
-              type: "text" as const,
-              text: JSON.stringify({
-                success: false,
-                tool: tool.name,
-                error: err instanceof Error ? err.message : String(err),
-              }),
-            }],
-            isError: true,
-          };
-        }
-      },
-    );
-  }
+  // Forward each tool call to the remote server and return its result verbatim
+  // (keeps non-text content like images intact).
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    try {
+      const result = (await remoteClient.callTool({
+        name,
+        arguments: args,
+      })) as CallToolResult;
+      return result;
+    } catch (err) {
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({
+            success: false,
+            tool: name,
+            error: err instanceof Error ? err.message : String(err),
+          }),
+        }],
+        isError: true,
+      } satisfies CallToolResult;
+    }
+  });
 
   // ── Start stdio transport ────────────────────────────────────────────────
 
