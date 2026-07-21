@@ -95,6 +95,9 @@ export interface ServerConfig extends ConnectorConfig {
   idaToolsets?: string;
   /** Comma-separated tool names to exclude */
   idaExcludeTools?: string;
+  /** Verbose IDA traffic: dump full request args + response content of every
+   *  ida-mcp-rs exchange to stderr. Also reads IDA_MCP_DEBUG env var. */
+  idaDebug?: boolean;
   /**
    * Idle-session TTL in seconds for HTTP transport. 0 (default) = never expire
    * on idle; the session is torn down only when the transport actually closes
@@ -574,6 +577,7 @@ export async function createServer(config: ServerConfig) {
       timeout: (config.idaTimeout ?? 600) * 1000,
       includeTools: includeTools.size ? includeTools : undefined,
       excludeTools: excludeTools.size ? excludeTools : undefined,
+      debug: config.idaDebug ?? false,
     });
 
     const modeLabel = config.idaBin ? `stdio (${config.idaBin})` : `HTTP (${config.idaEndpoint})`;

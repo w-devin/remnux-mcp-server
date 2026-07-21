@@ -150,6 +150,9 @@ function parseArgs(): ServerConfig {
         config.idaExcludeTools = value;
         consumeValue();
         break;
+      case "--ida-debug":
+        config.idaDebug = true;
+        break;
       case "--session-idle-ttl":
         config.sessionIdleTtlSecs = parseIntOrExit(value, "--session-idle-ttl");
         consumeValue();
@@ -176,6 +179,12 @@ function parseArgs(): ServerConfig {
   }
   if (!config.idaToken && process.env.IDA_MCP_TOKEN) {
     config.idaToken = process.env.IDA_MCP_TOKEN;
+  }
+  // Enable IDA traffic debug via env var (1/true/yes), mirroring --ida-debug.
+  // Useful for MCP clients (Claude Desktop) where you can't easily add CLI flags.
+  if (!config.idaDebug && process.env.IDA_MCP_DEBUG) {
+    const v = process.env.IDA_MCP_DEBUG.toLowerCase();
+    config.idaDebug = v === "1" || v === "true" || v === "yes" || v === "on";
   }
   if (config.sessionIdleTtlSecs === undefined && process.env.MCP_SESSION_IDLE_TTL_SECS) {
     config.sessionIdleTtlSecs = parseIntOrExit(
@@ -237,6 +246,10 @@ PROXY MODE (for Claude Desktop):
   --ida-toolsets <sets>   Comma-separated IDA toolset categories to expose
                           (e.g. core,functions,disasm,xrefs). Omit to expose all
   --ida-exclude-tools <t> Comma-separated IDA tool names to exclude from exposure
+  --ida-debug            Verbose: dump every ida-mcp-rs request args + response
+                          content to stderr (for diagnosing disconnects / bad
+                          tool output). Also reads IDA_MCP_DEBUG env var
+                          (1/true/yes/on)
   --session-idle-ttl <s>  Idle-session TTL in seconds for HTTP transport (default: 0
                           = never expire on idle; torn down only when the
                           connection actually closes). Also reads
