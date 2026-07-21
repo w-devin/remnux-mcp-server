@@ -150,6 +150,10 @@ function parseArgs(): ServerConfig {
         config.idaExcludeTools = value;
         consumeValue();
         break;
+      case "--session-idle-ttl":
+        config.sessionIdleTtlSecs = parseIntOrExit(value, "--session-idle-ttl");
+        consumeValue();
+        break;
       case "--help":
       case "-h":
         printHelp();
@@ -172,6 +176,12 @@ function parseArgs(): ServerConfig {
   }
   if (!config.idaToken && process.env.IDA_MCP_TOKEN) {
     config.idaToken = process.env.IDA_MCP_TOKEN;
+  }
+  if (config.sessionIdleTtlSecs === undefined && process.env.MCP_SESSION_IDLE_TTL_SECS) {
+    config.sessionIdleTtlSecs = parseIntOrExit(
+      process.env.MCP_SESSION_IDLE_TTL_SECS,
+      "MCP_SESSION_IDLE_TTL_SECS",
+    );
   }
 
   return config;
@@ -227,6 +237,10 @@ PROXY MODE (for Claude Desktop):
   --ida-toolsets <sets>   Comma-separated IDA toolset categories to expose
                           (e.g. core,functions,disasm,xrefs). Omit to expose all
   --ida-exclude-tools <t> Comma-separated IDA tool names to exclude from exposure
+  --session-idle-ttl <s>  Idle-session TTL in seconds for HTTP transport (default: 0
+                          = never expire on idle; torn down only when the
+                          connection actually closes). Also reads
+                          MCP_SESSION_IDLE_TTL_SECS env var
   -h, --help              Show this help message
   -v, --version           Show version
 

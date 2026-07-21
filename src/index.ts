@@ -95,6 +95,14 @@ export interface ServerConfig extends ConnectorConfig {
   idaToolsets?: string;
   /** Comma-separated tool names to exclude */
   idaExcludeTools?: string;
+  /**
+   * Idle-session TTL in seconds for HTTP transport. 0 (default) = never expire
+   * on idle; the session is torn down only when the transport actually closes
+   * (client DELETE, or the long-lived GET SSE stream cancels). The old default
+   * of 30 min killed sessions still holding an active SSE stream — the main
+   * cause of mid-session disconnects.
+   */
+  sessionIdleTtlSecs?: number;
 }
 
 export async function createServer(config: ServerConfig) {
@@ -793,11 +801,18 @@ async function startHttpServer(config: ServerConfig) {
 
   // Session management: map session ID → transport (capped to prevent memory exhaustion)
   const MAX_SESSIONS = 100;
-  const SESSION_IDLE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+  // Idle-session TTL. 0 (default) = never expire on idle; the session is torn
+  // down only when the transport actually closes (client DELETE, or the
+  // long-lived GET SSE stream's cancel/close). The previous 30-min default
+  // killed sessions still holding an active SSE stream — the main cause of
+  // mid-session disconnects. Tune via --session-idle-ttl <secs> or
+  // MCP_SESSION_IDLE_TTL_SECS. Any positive value restores the old behavior.
+  const SESSION_IDLE_TTL_MS = (config.sessionIdleTtlSecs ?? 0) * 1000;
   const sessions = new Map<string, StreamableHTTPServerTransport>();
   const sessionTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   function resetSessionTimer(sessionId: string) {
+    if (SESSION_IDLE_TTL_MS <= 0) return;
     const existing = sessionTimers.get(sessionId);
     if (existing) clearTimeout(existing);
     sessionTimers.set(sessionId, setTimeout(() => {
@@ -868,11 +883,19 @@ async function startHttpServer(config: ServerConfig) {
   const authStatus = token ? "auth enabled" : "NO AUTH";
 
   return new Promise<void>((resolve) => {
-    app.listen(port, host, () => {
+    const httpServer = app.listen(port, host, () => {
       console.error(
         `REMnux MCP server started${warnings} — HTTP ${authStatus} at http://${host}:${port}/mcp`
       );
       resolve();
     });
+    // Keep long-lived GET SSE streams alive. Node's per-request idle timeouts
+    // (requestTimeout 5 min, headersTimeout 60 s, keepAliveTimeout 5 s) would
+    // otherwise drop an idle-but-open SSE stream between tool calls. With
+    // session-idle TTL disabled by default, there is no server-side reason to
+    // cut these connections, so disable the kill switches.
+    httpServer.requestTimeout = 0;
+    httpServer.headersTimeout = 0;
+    httpServer.keepAliveTimeout = 0;
   });
 }
