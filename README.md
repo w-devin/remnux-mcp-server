@@ -339,7 +339,7 @@ npx @remnux/mcp-server --ida-bin=/usr/local/bin/ida-mcp \
 - **Stdio mode manages the child lifecycle.** The ida-mcp-rs process is spawned lazily (on first `ida_*` tool call) and killed when the server shuts down. No separate process management needed.
 - **HTTP mode requires a running instance.** If ida-mcp-rs is not reachable at startup, a warning is logged and REMnux tools still work normally. IDA tools become available once ida-mcp-rs starts.
 - **ida-mcp-rs must have IDA Pro / idalib.** It links against IDA's headless SDK at build time and loads IDA libraries at runtime. See [ida-mcp-rs building docs](https://github.com/blacktop/ida-mcp-rs/blob/main/docs/BUILDING.md).
-- **Timeout coordination.** The `--ida-timeout` flag (default 300s) controls per-tool-call timeouts to ida-mcp-rs. Set it higher than the longest expected IDA operation (e.g., decompiling a large binary).
+- **Timeout coordination.** The `--ida-timeout` flag (default 600s) controls per-tool-call timeouts to ida-mcp-rs. Set it higher than the longest expected IDA operation (e.g., decompiling a large binary).
 - **Tool descriptions are from ida-mcp-rs.** The `ida_*` tools carry their original descriptions from ida-mcp-rs, prefixed with `[Proxied to IDA Pro via ida-mcp-rs]`. Use `ida_tool_catalog` or `ida_tool_help` for detailed docs.
 - **No changes to ida-mcp-rs needed.** This integration uses ida-mcp-rs's standard MCP interface (stdio or HTTP) — no patches or forks required.
 
@@ -367,7 +367,7 @@ npx @remnux/mcp-server --ida-bin=/usr/local/bin/ida-mcp \
 | `--ida-bin` | Path to ida-mcp-rs binary. Spawns it as a child process via stdio (auto-started, auto-killed). Takes precedence over `--ida-endpoint` if both set | - |
 | `--ida-bin-args` | Comma-separated extra arguments for the ida-mcp-rs binary (e.g. `--read-only`) | - |
 | `--ida-token` | Bearer token for ida-mcp-rs HTTP auth (also reads `IDA_MCP_TOKEN` env var) | - |
-| `--ida-timeout` | Per-IDA-tool-call timeout in seconds | `300` |
+| `--ida-timeout` | Per-IDA-tool-call timeout in seconds | `600` |
 | `--ida-toolsets` | Comma-separated IDA toolset categories to expose (e.g. `core,functions,disasm`). Omit to expose all | all |
 | `--ida-exclude-tools` | Comma-separated IDA tool names to exclude from exposure | - |
 

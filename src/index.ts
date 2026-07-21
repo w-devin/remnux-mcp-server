@@ -89,7 +89,7 @@ export interface ServerConfig extends ConnectorConfig {
   idaEndpoint?: string;
   /** Bearer token for ida-mcp-rs HTTP auth */
   idaToken?: string;
-  /** Per-IDA-tool-call timeout in seconds (default: 300) */
+  /** Per-IDA-tool-call timeout in seconds (default: 600) */
   idaTimeout?: number;
   /** Comma-separated toolsets to expose (e.g. "core,functions,disasm") */
   idaToolsets?: string;
@@ -571,7 +571,7 @@ export async function createServer(config: ServerConfig) {
       binArgs: config.idaBinArgs,
       endpoint: config.idaEndpoint,
       token: config.idaToken,
-      timeout: (config.idaTimeout ?? 300) * 1000,
+      timeout: (config.idaTimeout ?? 600) * 1000,
       includeTools: includeTools.size ? includeTools : undefined,
       excludeTools: excludeTools.size ? excludeTools : undefined,
     });
@@ -848,6 +848,14 @@ async function startHttpServer(config: ServerConfig) {
         sessionIdGenerator: () => randomUUID(),
       });
 
+      const { server, idaConnector } = await createServer(config);
+      await server.connect(transport);
+
+      // Tie the IDA sub-connection's lifetime to this HTTP session: when the
+      // session's transport closes (client DELETE, idle TTL, or the GET SSE
+      // stream cancels), disconnect the ida-mcp-rs child/link this session
+      // owns. Without this, each closed session leaks an ida-mcp-rs connection
+      // (a stdio child process, or an orphaned HTTP session id).
       transport.onclose = () => {
         if (transport.sessionId) {
           sessions.delete(transport.sessionId);
@@ -857,10 +865,8 @@ async function startHttpServer(config: ServerConfig) {
             sessionTimers.delete(transport.sessionId);
           }
         }
+        idaConnector?.disconnect().catch(() => { /* best-effort */ });
       };
-
-      const { server } = await createServer(config);
-      await server.connect(transport);
 
       await transport.handleRequest(req, res, req.body);
 

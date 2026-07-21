@@ -233,7 +233,7 @@ PROXY MODE (for Claude Desktop):
   --ida-bin-args <args>   Comma-separated extra arguments for the ida-mcp-rs binary
                           (e.g. "--read-only,--log-level,debug")
   --ida-token <token>     Bearer token for ida-mcp-rs HTTP auth (also reads IDA_MCP_TOKEN env var)
-  --ida-timeout <secs>    Per-IDA-tool-call timeout (default: 300)
+  --ida-timeout <secs>    Per-IDA-tool-call timeout (default: 600)
   --ida-toolsets <sets>   Comma-separated IDA toolset categories to expose
                           (e.g. core,functions,disasm,xrefs). Omit to expose all
   --ida-exclude-tools <t> Comma-separated IDA tool names to exclude from exposure
