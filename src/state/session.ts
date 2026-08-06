@@ -1,12 +1,13 @@
 /**
- * Session-level state for tracking archive metadata across tool calls.
+ * Process-level archive metadata cache shared by stateless HTTP requests.
  *
- * When extract_archive succeeds, we store the format and password used.
- * When download_file runs with archive: true, we look up matching metadata
- * to re-use the same format and password for the download archive.
+ * When extract_archive succeeds, we store the format and password used. When
+ * download_file runs with archive: true, it can re-use the same metadata. The
+ * cache is bounded and entries expire so stateless HTTP operation does not turn
+ * this convenience state into unbounded process memory.
  */
 
-import { basename } from "path";
+import { basename, posix } from "node:path";
 
 export const DEFAULT_ARCHIVE_PASSWORD = "infected";
 export const DEFAULT_ARCHIVE_FORMAT = "zip" as const;
@@ -16,44 +17,75 @@ export interface ArchiveMetadata {
   password: string;
 }
 
-export class SessionState {
-  /**
-   * Maps sample filenames to the archive metadata from their extraction.
-   * Keys include both the archive filename and each extracted filename.
-   */
-  private archiveInfo = new Map<string, ArchiveMetadata>();
+interface ArchiveMetadataEntry {
+  metadata: ArchiveMetadata;
+  storedAt: number;
+}
 
-  /**
-   * Store archive metadata after a successful extraction.
-   *
-   * @param archiveFile - The archive filename (e.g., "sample.zip")
-   * @param extractedFiles - List of extracted filenames
-   * @param format - Archive format used
-   * @param password - Password that worked (empty string if none)
-   */
+export class SessionState {
+  private archiveInfo = new Map<string, ArchiveMetadataEntry>();
+
+  constructor(
+    private readonly maxEntries = 1000,
+    private readonly ttlMs = 24 * 60 * 60 * 1000,
+  ) {}
+
   storeArchiveInfo(
     archiveFile: string,
     extractedFiles: string[],
     format: ArchiveMetadata["format"],
-    password: string
+    password: string,
   ): void {
-    const meta: ArchiveMetadata = { format, password };
-    this.archiveInfo.set(archiveFile, meta);
+    const entry: ArchiveMetadataEntry = {
+      metadata: { format, password },
+      storedAt: Date.now(),
+    };
+    this.storeAllKeys(archiveFile, entry);
     for (const file of extractedFiles) {
-      this.archiveInfo.set(file, meta);
-      // Also store by basename so download_file can look up by basename(file_path)
-      const base = basename(file);
-      if (base !== file) {
-        this.archiveInfo.set(base, meta);
-      }
+      this.storeAllKeys(file, entry);
+    }
+    this.evictExpiredAndOverflow();
+  }
+
+  getArchiveInfo(filename: string): ArchiveMetadata | undefined {
+    this.evictExpiredAndOverflow();
+    for (const key of archiveKeys(filename)) {
+      const entry = this.archiveInfo.get(key);
+      if (entry) return entry.metadata;
+    }
+    return undefined;
+  }
+
+  private storeAllKeys(file: string, entry: ArchiveMetadataEntry): void {
+    for (const key of archiveKeys(file)) {
+      this.archiveInfo.delete(key);
+      this.archiveInfo.set(key, entry);
     }
   }
 
-  /**
-   * Look up archive metadata for a given filename.
-   * Returns undefined if no metadata was stored for this file.
-   */
-  getArchiveInfo(filename: string): ArchiveMetadata | undefined {
-    return this.archiveInfo.get(filename);
+  private evictExpiredAndOverflow(): void {
+    const now = Date.now();
+    for (const [key, entry] of this.archiveInfo) {
+      if (now - entry.storedAt > this.ttlMs) this.archiveInfo.delete(key);
+    }
+    while (this.archiveInfo.size > this.maxEntries) {
+      const oldestKey = this.archiveInfo.keys().next().value as string | undefined;
+      if (oldestKey === undefined) break;
+      this.archiveInfo.delete(oldestKey);
+    }
   }
+}
+
+function archiveKeys(file: string): string[] {
+  const normalized = normalizeArchiveKey(file);
+  if (!normalized) return [];
+  const base = basename(normalized);
+  return base === normalized ? [normalized] : [normalized, base];
+}
+
+function normalizeArchiveKey(file: string): string {
+  const slashPath = file.trim().replace(/\\/g, "/");
+  if (!slashPath) return "";
+  const normalized = posix.normalize(slashPath);
+  return normalized === "." ? "" : normalized.replace(/^\.\//, "");
 }

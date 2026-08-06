@@ -44,6 +44,13 @@ export interface IdaConnectorConfig {
    *  listTools/callTool exchange with ida-mcp-rs to stderr. Off by default —
    *  lifecycle logs (connect/onclose/reconnect/disconnect) always emit. */
   debug?: boolean;
+  /** Rebuild the upstream connection once after an unexpected close. A
+   *  stateful analysis registry disables this because a replacement worker has
+   *  no previously opened IDB. */
+  reconnectOnClose?: boolean;
+  /** Called after an unexpected upstream close. Used by the analysis registry
+   *  to release the now-invalid analysis_id. */
+  onUnexpectedClose?: () => void;
 }
 
 export interface IdaToolMeta {
@@ -173,8 +180,10 @@ export class IdaConnector {
           log(`onclose: client closed by disconnect() (clean shutdown)`);
         } else {
           // This is THE disconnect signal — an unexpected transport death.
-          // The next callTool/listTools will rebuild transparently.
-          log(`onclose: transport died unexpectedly (wasAlive=${wasAlive}); client marked dead, will rebuild on next call`);
+          // Stateful callers can release their analysis handle here rather
+          // than reconnecting to a fresh worker with no IDB loaded.
+          log(`onclose: transport died unexpectedly (wasAlive=${wasAlive}); client marked dead`);
+          this.config.onUnexpectedClose?.();
         }
       };
 
@@ -254,7 +263,7 @@ export class IdaConnector {
     try {
       return await this.callToolOnce(name, args);
     } catch (err) {
-      if (!isDeadConnection(err)) throw err;
+      if (!isDeadConnection(err) || this.config.reconnectOnClose === false) throw err;
       log(`callTool '${name}' hit dead connection (${describeError(err)}), forcing reconnect and retrying once`);
       await this.connect();
       return this.callToolOnce(name, args);
@@ -306,14 +315,30 @@ export class IdaConnector {
     this.clientAlive = false;
     this.closing = true;
     const client = this.client;
+    const transport = this.transport;
     this.client = null;
     this.transport = null;
+
+    // Client.close() only tears down the local HTTP transport. Explicitly send
+    // DELETE when an upstream Streamable HTTP session exists so ida-mcp-rs can
+    // promptly reclaim its worker/session resources. The SDK treats 405 as a
+    // valid response for a server that deliberately has no DELETE support.
+    if (transport instanceof StreamableHTTPClientTransport) {
+      try {
+        await transport.terminateSession();
+      } catch (err) {
+        log(`disconnect: terminateSession() threw (${describeError(err)}) — best-effort, continuing`);
+      }
+    }
+
     try {
       if (client) {
         await client.close();
+      } else if (transport) {
+        await transport.close();
       }
     } catch (err) {
-      log(`disconnect: client.close() threw (${describeError(err)}) — best-effort, continuing`);
+      log(`disconnect: transport close threw (${describeError(err)}) — best-effort, continuing`);
       // Best-effort — ida-mcp-rs may already be gone
     }
     log(`disconnected (mode=${this.mode})`);

@@ -7,7 +7,7 @@ import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import type { OAuthTokenVerifier } from "@modelcontextprotocol/sdk/server/auth/provider.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
-import { createConnector, type ConnectorConfig } from "./connectors/index.js";
+import { createConnector, type Connector, type ConnectorConfig } from "./connectors/index.js";
 import {
   runToolSchema,
   getFileInfoSchema,
@@ -52,7 +52,9 @@ import { toolRegistry } from "./tools/registry.js";
 import { REPORT_TEMPLATE, GUIDELINES_DIGEST, ATTRIBUTION, SOURCE_META } from "./report/content.generated.js";
 import { OPTIONAL_SECTION_CONVENTION } from "./report/optional-sections.js";
 import { httpBindRequiresToken } from "./utils/loopback.js";
-import { IdaConnector } from "./connectors/ida.js";
+import type { IdaConnectorConfig } from "./connectors/ida.js";
+import { IdaAnalysisRegistry } from "./ida/analysis-registry.js";
+import { withRemnuxToolLogging } from "./logging/remnux.js";
 
 /** ida-mcp-rs tool category → tool name list (for --ida-toolsets filtering) */
 const IDA_TOOL_CATEGORIES: Record<string, string[]> = {
@@ -98,17 +100,76 @@ export interface ServerConfig extends ConnectorConfig {
   /** Verbose IDA traffic: dump full request args + response content of every
    *  ida-mcp-rs exchange to stderr. Also reads IDA_MCP_DEBUG env var. */
   idaDebug?: boolean;
-  /**
-   * Idle-session TTL in seconds for HTTP transport. 0 (default) = never expire
-   * on idle; the session is torn down only when the transport actually closes
-   * (client DELETE, or the long-lived GET SSE stream cancels). The old default
-   * of 30 min killed sessions still holding an active SSE stream — the main
-   * cause of mid-session disconnects.
-   */
+  /** Maximum simultaneously open IDA analysis contexts (default: 2). */
+  idaMaxConcurrentAnalyses?: number;
+  /** Verbose REMnux tool traffic logging. Also reads REMNUX_MCP_DEBUG. */
+  remnuxDebug?: boolean;
+  /** @deprecated Ignored in stateless HTTP mode; retained for CLI compatibility. */
   sessionIdleTtlSecs?: number;
 }
 
-export async function createServer(config: ServerConfig) {
+export interface ServerRuntime {
+  connector: Connector;
+  sessionState: SessionState;
+  idaRegistry?: IdaAnalysisRegistry;
+  close(): Promise<void>;
+}
+
+export async function createServerRuntime(config: ServerConfig): Promise<ServerRuntime> {
+  const connector = await createConnector(config);
+  const sessionState = new SessionState();
+  const idaRegistry = config.idaBin || config.idaEndpoint
+    ? new IdaAnalysisRegistry(
+        buildIdaConnectorConfig(config),
+        config.idaMaxConcurrentAnalyses ?? 2,
+      )
+    : undefined;
+
+  let closed = false;
+  return {
+    connector,
+    sessionState,
+    idaRegistry,
+    async close() {
+      if (closed) return;
+      closed = true;
+      await idaRegistry?.closeAll();
+      await connector.disconnect();
+    },
+  };
+}
+
+function buildIdaConnectorConfig(config: ServerConfig): IdaConnectorConfig {
+  const includeTools = new Set<string>();
+  if (config.idaToolsets) {
+    for (const category of config.idaToolsets.split(",").map((value) => value.trim().toLowerCase())) {
+      const names = IDA_TOOL_CATEGORIES[category];
+      if (names) {
+        for (const name of names) includeTools.add(name);
+      } else {
+        console.error(
+          `WARNING: unknown IDA toolset '${category}' (known: ${Object.keys(IDA_TOOL_CATEGORIES).join(", ")})`,
+        );
+      }
+    }
+  }
+  const excludeTools = new Set<string>(
+    config.idaExcludeTools ? config.idaExcludeTools.split(",").map((value) => value.trim()) : [],
+  );
+
+  return {
+    bin: config.idaBin,
+    binArgs: config.idaBinArgs,
+    endpoint: config.idaEndpoint,
+    token: config.idaToken,
+    timeout: (config.idaTimeout ?? 600) * 1000,
+    includeTools: includeTools.size ? includeTools : undefined,
+    excludeTools: excludeTools.size ? excludeTools : undefined,
+    debug: config.idaDebug ?? false,
+  };
+}
+
+export async function createServer(config: ServerConfig, runtime?: ServerRuntime) {
   const _require = createRequire(import.meta.url);
   // In a Bun-compiled binary, __PACKAGE_VERSION__ is injected at compile time via --define.
   // In normal Node.js mode, read from package.json.
@@ -148,12 +209,13 @@ export async function createServer(config: ServerConfig) {
     },
   );
 
-  const connector = await createConnector(config);
-
-  const sessionState = new SessionState();
+  const activeRuntime = runtime ?? await createServerRuntime(config);
+  const ownsRuntime = runtime === undefined;
+  const serverId = randomUUID().slice(0, 8);
+  const logOptions = { debug: config.remnuxDebug ?? false, serverId };
 
   const deps: HandlerDeps = {
-    connector,
+    connector: activeRuntime.connector,
     config: {
       samplesDir: config.samplesDir,
       outputDir: config.outputDir,
@@ -163,7 +225,7 @@ export async function createServer(config: ServerConfig) {
       transport: config.transport,
       ingestRoot: config.ingestRoot,
     },
-    sessionState,
+    sessionState: activeRuntime.sessionState,
   };
 
   // Tool: run_tool - Execute a command in REMnux
@@ -175,7 +237,7 @@ export async function createServer(config: ServerConfig) {
     "on strings/data) rather than behavioral; a behavioral capability requires the corresponding APIs to be " +
     "imported or dynamically resolved. analyze_file tags capa findings with evidence_types to make this explicit.",
     runToolSchema.shape,
-    (args) => handleRunTool(deps, args)
+    withRemnuxToolLogging("run_tool", logOptions, (args) => handleRunTool(deps, args))
   );
 
   // Tool: get_file_info - Get basic file information
@@ -183,7 +245,7 @@ export async function createServer(config: ServerConfig) {
     "get_file_info",
     "Get file type, hashes, and basic metadata",
     getFileInfoSchema.shape,
-    (args) => handleGetFileInfo(deps, args)
+    withRemnuxToolLogging("get_file_info", logOptions, (args) => handleGetFileInfo(deps, args))
   );
 
   // Tool: list_files - List files in samples or output directory
@@ -191,7 +253,7 @@ export async function createServer(config: ServerConfig) {
     "list_files",
     "List files in samples or output directory",
     listFilesSchema.shape,
-    (args) => handleListFiles(deps, args)
+    withRemnuxToolLogging("list_files", logOptions, (args) => handleListFiles(deps, args))
   );
 
   // Tool: extract_archive - Extract files from compressed archives
@@ -199,7 +261,7 @@ export async function createServer(config: ServerConfig) {
     "extract_archive",
     "Extract files from a compressed archive (.zip, .7z, .rar), including WinZip AES-256 .zip and header-encrypted .7z (-mhe=on) — these route through 7z automatically. Tries a supplied password first, then common malware passwords (infected, malware, virus) if the archive is password-protected. Returns list of extracted files.",
     extractArchiveSchema.shape,
-    (args) => handleExtractArchive(deps, args)
+    withRemnuxToolLogging("extract_archive", logOptions, (args) => handleExtractArchive(deps, args))
   );
 
   // Tool: upload_from_host - Upload a file from the host filesystem
@@ -241,7 +303,7 @@ export async function createServer(config: ServerConfig) {
     "upload_from_host",
     uploadDescription,
     uploadFromHostSchema.shape,
-    (args) => handleUploadFromHost(deps, args)
+    withRemnuxToolLogging("upload_from_host", logOptions, (args) => handleUploadFromHost(deps, args))
   );
 
   // Tool: download_from_url - Download a file from a URL into samples
@@ -251,7 +313,7 @@ export async function createServer(config: ServerConfig) {
     "Returns file metadata (hashes, type, size). Supports custom HTTP headers " +
     "and an optional thug mode for sites requiring JavaScript execution.",
     downloadFromUrlSchema.shape,
-    (args) => handleDownloadFromUrl(deps, args)
+    withRemnuxToolLogging("download_from_url", logOptions, (args) => handleDownloadFromUrl(deps, args))
   );
 
   // Tool: download_file - Download a file from the output directory
@@ -262,7 +324,7 @@ export async function createServer(config: ServerConfig) {
     "Pass archive: false for harmless files like text reports. " +
     "Provide output_path to save directly to the host filesystem.",
     downloadFileSchema.shape,
-    (args) => handleDownloadFile(deps, args)
+    withRemnuxToolLogging("download_file", logOptions, (args) => handleDownloadFile(deps, args))
   );
 
   // Tool: analyze_file - Auto-analyze a file using appropriate REMnux tools
@@ -270,7 +332,7 @@ export async function createServer(config: ServerConfig) {
     "analyze_file",
     "Auto-analyze a file using REMnux tools appropriate for the detected file type. Runs `file` to detect type, then executes matching tools (e.g., PE → peframe/capa, PDF → pdfid/pdf-parser, Office → olevba/oleid). Use `depth` to control analysis intensity: 'quick' (triage only), 'standard' (default), 'deep' (includes expensive tools). Note: 'standard' is sufficient for most files; use 'deep' only when standard doesn't reveal enough. Output includes a capability_evidence field (behavior_capable vs artifact_only) and per-capa evidence_types tags so you can tell code-backed capabilities from data-only artifacts — an artifact_only match means the data is present, not that the behavior executes.",
     analyzeFileSchema.shape,
-    (args) => handleAnalyzeFile(deps, args)
+    withRemnuxToolLogging("analyze_file", logOptions, (args) => handleAnalyzeFile(deps, args))
   );
 
   // Tool: suggest_tools - Get tool recommendations for a file
@@ -282,7 +344,7 @@ export async function createServer(config: ServerConfig) {
     "For binaries, confirming a behavior (versus merely finding its artifacts) generally requires more than " +
     "static analysis — plan for emulation (speakeasy) or sandbox detonation when a behavioral claim is needed.",
     suggestToolsSchema.shape,
-    (args) => handleSuggestTools(deps, args)
+    withRemnuxToolLogging("suggest_tools", logOptions, (args) => handleSuggestTools(deps, args))
   );
 
   // Tool: extract_iocs - Extract IOCs from text
@@ -296,7 +358,7 @@ export async function createServer(config: ServerConfig) {
     "binary uses it at runtime. Cross-reference it against reachable code or dynamic analysis before treating " +
     "it as an operational indicator.",
     extractIOCsSchema.shape,
-    (args) => handleExtractIOCs(deps, args)
+    withRemnuxToolLogging("extract_iocs", logOptions, (args) => handleExtractIOCs(deps, args))
   );
 
   // Tool: check_behavior_prerequisites - Static gate before claiming a behavior
@@ -311,7 +373,7 @@ export async function createServer(config: ServerConfig) {
     "/ not_applicable (not a PE). This is a STATIC gate — it tells you whether the binary CAN call the required " +
     "APIs, not whether it does. Omit `behavior` to scan all. Confirm any behavior with dynamic analysis.",
     checkBehaviorPrerequisitesSchema.shape,
-    (args) => handleCheckBehaviorPrerequisites(deps, args)
+    withRemnuxToolLogging("check_behavior_prerequisites", logOptions, (args) => handleCheckBehaviorPrerequisites(deps, args))
   );
 
   // Tool: verify_string_usage - Is an embedded string referenced by code, or vestigial?
@@ -325,7 +387,7 @@ export async function createServer(config: ServerConfig) {
     "incomplete: packed, timed out, or version drift — never a negative). A static check: never concludes a " +
     "string is 'unused', and confirm runtime use dynamically.",
     verifyStringUsageSchema.shape,
-    (args) => handleVerifyStringUsage(deps, args)
+    withRemnuxToolLogging("verify_string_usage", logOptions, (args) => handleVerifyStringUsage(deps, args))
   );
 
   // Tool: compare_files - Structured diff of two related samples
@@ -336,7 +398,7 @@ export async function createServer(config: ServerConfig) {
     "section changes. Reuses readpe/diec/capa/radare2. Use depth='quick' to skip the (slower) capa capability diff. " +
     "Surfaces what each stage adds without re-running tools by hand.",
     compareFilesSchema.shape,
-    (args) => handleCompareFiles(deps, args)
+    withRemnuxToolLogging("compare_files", logOptions, (args) => handleCompareFiles(deps, args))
   );
 
   // Tool: get_tool_help - Get usage help for a REMnux tool
@@ -345,7 +407,7 @@ export async function createServer(config: ServerConfig) {
     "Get usage help for a REMnux tool. Returns the tool's --help output " +
     "so you can understand available flags, options, and usage patterns.",
     getToolHelpSchema.shape,
-    (args) => handleGetToolHelp(deps, args)
+    withRemnuxToolLogging("get_tool_help", logOptions, (args) => handleGetToolHelp(deps, args))
   );
 
   // Tool: check_tools - Check tool availability
@@ -353,7 +415,7 @@ export async function createServer(config: ServerConfig) {
     "check_tools",
     "Check which REMnux analysis tools are installed and available. Returns a summary of installed vs missing tools across all file type categories.",
     checkToolsSchema.shape,
-    () => handleCheckTools(deps)
+    withRemnuxToolLogging("check_tools", logOptions, () => handleCheckTools(deps))
   );
 
   // Tool: get_report_template - Bundled malware analysis report template (offline)
@@ -365,7 +427,7 @@ export async function createServer(config: ServerConfig) {
     "resolve (include only if warranted, and drop the marker), not literal heading text. " +
     "For interactive review/scoring or the latest version, the zeltser-website MCP server's malware_get_template offers more when connected.",
     getReportTemplateSchema.shape,
-    () => handleGetReportTemplate(deps)
+    withRemnuxToolLogging("get_report_template", logOptions, () => handleGetReportTemplate(deps))
   );
 
   // Tool: get_report_guidance - Bundled malware analysis report writing guidelines (offline)
@@ -380,7 +442,7 @@ export async function createServer(config: ServerConfig) {
     "interactive review or numeric scoring, the zeltser-website MCP server's malware_review_report / " +
     "rating_score_writing offer more when connected.",
     getReportGuidanceSchema.shape,
-    (args) => handleGetReportGuidance(deps, args)
+    withRemnuxToolLogging("get_report_guidance", logOptions, (args) => handleGetReportGuidance(deps, args))
   );
 
   // Tool: get_osint_guidance - OSINT triage tradecraft + curated lookup catalog for malware indicators (offline)
@@ -393,7 +455,7 @@ export async function createServer(config: ServerConfig) {
     "to a hash, url, domain, ip, family, or host_artifact. Guidance only: it runs no lookups and stores no API " +
     "keys; the AI performs the lookups with its own tools.",
     getOsintGuidanceSchema.shape,
-    (args) => handleGetOsintGuidance(deps, args)
+    withRemnuxToolLogging("get_osint_guidance", logOptions, (args) => handleGetOsintGuidance(deps, args))
   );
 
   // ── MCP Resources: Tool Registry ──────────────────────────────────────────
@@ -550,106 +612,69 @@ export async function createServer(config: ServerConfig) {
   );
 
   // ── IDA Pro integration (optional) ─────────────────────────────────────────
-  // When --ida-endpoint is set, connect to ida-mcp-rs and register its tools
-  // with the ida_ prefix so a single MCP endpoint serves both REMnux and IDA.
-
-  if (config.idaBin || config.idaEndpoint) {
-    const includeTools = new Set<string>();
-    if (config.idaToolsets) {
-      for (const cat of config.idaToolsets.split(",").map((s) => s.trim().toLowerCase())) {
-        const names = IDA_TOOL_CATEGORIES[cat];
-        if (names) {
-          for (const n of names) includeTools.add(n);
-        } else {
-          console.error(`WARNING: unknown IDA toolset '${cat}' (known: ${Object.keys(IDA_TOOL_CATEGORIES).join(", ")})`);
+  // IDA state belongs to an explicit analysis_id, not to an MCP HTTP session.
+  // Registration is intentionally lazy: creating a REMnux server must never
+  // spawn/connect an ida-mcp-rs worker.
+  const ida = activeRuntime.idaRegistry;
+  if (ida) {
+    server.tool(
+      "ida_tool",
+      "Execute an IDA Pro analysis tool by name via ida-mcp-rs. Call open_idb or open_dsc first; " +
+      "the response contains analysis_id, which must be passed to later calls when more than one analysis is active. " +
+      "Use ida_tools_list to discover available tools and their parameters.",
+      {
+        analysis_id: z.string().optional().describe(
+          "Analysis handle returned by open_idb/open_dsc. Required when multiple analyses are active.",
+        ),
+        name: z.string().describe("IDA tool name (e.g. 'open_idb', 'decompile', 'list_functions')"),
+        arguments: z.record(z.unknown()).optional().describe("Tool-specific parameters as key-value pairs"),
+      },
+      async (args) => {
+        const start = Date.now();
+        try {
+          const result = await ida.callTool(
+            args.analysis_id,
+            args.name,
+            (args.arguments ?? {}) as Record<string, unknown>,
+          );
+          return formatIdaToolResult(args.name, result, start);
+        } catch (err) {
+          return formatIdaToolError(`ida_${args.name}`, err, start);
         }
-      }
-    }
-    const excludeTools = new Set<string>(
-      config.idaExcludeTools ? config.idaExcludeTools.split(",").map((s) => s.trim()) : [],
+      },
     );
 
-    const ida = new IdaConnector({
-      bin: config.idaBin,
-      binArgs: config.idaBinArgs,
-      endpoint: config.idaEndpoint,
-      token: config.idaToken,
-      timeout: (config.idaTimeout ?? 600) * 1000,
-      includeTools: includeTools.size ? includeTools : undefined,
-      excludeTools: excludeTools.size ? excludeTools : undefined,
-      debug: config.idaDebug ?? false,
-    });
-
-    const modeLabel = config.idaBin ? `stdio (${config.idaBin})` : `HTTP (${config.idaEndpoint})`;
-    try {
-      const idaTools = await ida.listTools();
-      console.error(`IDA: connected via ${modeLabel}, ${idaTools.length} tools available`);
-
-      // ── ida_tool: execute any IDA tool by name (mirrors run_tool pattern) ──
-      server.tool(
-        "ida_tool",
-        "Execute an IDA Pro analysis tool by name via ida-mcp-rs. " +
-        "Use ida_tools_list to discover available tools and their parameters. " +
-        "Example: {\"name\": \"decompile\", \"arguments\": {\"addr\": \"0x401000\"}}",
-        {
-          name: z.string().describe("IDA tool name (e.g. 'decompile', 'list_functions', 'xrefs_to')"),
-          arguments: z.record(z.unknown()).optional().describe("Tool-specific parameters as key-value pairs"),
-        },
-        async (args) => {
-          const start = Date.now();
-          try {
-            const result = await ida.callTool(args.name, (args.arguments ?? {}) as Record<string, unknown>);
-            return {
-              content: result.content.map((c) => ({
-                type: "text" as const,
-                text: typeof c.text === "string" ? c.text : JSON.stringify(c),
-              })),
-              isError: result.isError,
-            };
-          } catch (err) {
-            return {
-              content: [{ type: "text" as const, text: JSON.stringify({
-                success: false,
-                tool: `ida_${args.name}`,
-                error: err instanceof Error ? err.message : String(err),
-                metadata: { elapsed_ms: Date.now() - start },
-              }, null, 2) }],
-              isError: true,
-            };
-          }
-        },
-      );
-
-      // ── ida_tools_list: discover available IDA tools ──
-      server.tool(
-        "ida_tools_list",
-        "List all available IDA Pro tools with descriptions and parameter schemas. " +
-        "Use this to discover what IDA tools are available before calling ida_tool. " +
-        "Pass a category to filter (e.g. 'functions', 'decompile', 'xrefs'). " +
-        "Pass a query to search tool names and descriptions.",
-        {
-          category: z.string().optional().describe(
-            "Filter by category: core, functions, disassembly, decompile, xrefs, " +
-            "controlflow, memory, search, metadata, types, editing, scripting"
-          ),
-          query: z.string().optional().describe("Search tools by name or description (substring match)"),
-        },
-        async (args) => {
-          const start = Date.now();
-          const tools = await ida.listTools();
+    server.tool(
+      "ida_tools_list",
+      "Lazily list the IDA Pro tools available from ida-mcp-rs, with descriptions and parameter schemas. " +
+      "Pass category or query to filter. This does not open an IDB.",
+      {
+        analysis_id: z.string().optional().describe(
+          "Optional analysis handle to query its existing IDA worker.",
+        ),
+        category: z.string().optional().describe(
+          "Filter by category: core, functions, disassembly, decompile, xrefs, " +
+          "controlflow, memory, search, metadata, types, editing, scripting",
+        ),
+        query: z.string().optional().describe("Search tool names and descriptions (substring match)"),
+      },
+      async (args) => {
+        const start = Date.now();
+        try {
+          const tools = await ida.listTools(args.analysis_id);
           let filtered = tools;
 
           if (args.category) {
-            const catTools = IDA_TOOL_CATEGORIES[args.category.toLowerCase()];
-            if (catTools) {
-              filtered = filtered.filter((t) => catTools.includes(t.name));
+            const categoryTools = IDA_TOOL_CATEGORIES[args.category.toLowerCase()];
+            if (categoryTools) {
+              filtered = filtered.filter((tool) => categoryTools.includes(tool.name));
             }
           }
 
           if (args.query) {
-            const q = args.query.toLowerCase();
-            filtered = filtered.filter((t) =>
-              t.name.includes(q) || (t.description ?? "").toLowerCase().includes(q)
+            const query = args.query.toLowerCase();
+            filtered = filtered.filter((tool) =>
+              tool.name.includes(query) || (tool.description ?? "").toLowerCase().includes(query),
             );
           }
 
@@ -661,27 +686,34 @@ export async function createServer(config: ServerConfig) {
                 tool: "ida_tools_list",
                 data: {
                   total: filtered.length,
-                  tools: filtered.map((t) => ({
-                    name: t.name,
-                    description: t.description,
-                    parameters: t.inputSchema.properties ?? {},
-                    required: t.inputSchema.required ?? [],
+                  tools: filtered.map((tool) => ({
+                    name: tool.name,
+                    description: tool.description,
+                    parameters: tool.inputSchema.properties ?? {},
+                    required: tool.inputSchema.required ?? [],
                   })),
                 },
                 metadata: { elapsed_ms: Date.now() - start },
               }, null, 2),
             }],
           };
-        },
-      );
+        } catch (err) {
+          return formatIdaToolError("ida_tools_list", err, start);
+        }
+      },
+    );
 
-      // ── ida_status: connection health check ──
-      server.tool(
-        "ida_status",
-        "Check the connection status to ida-mcp-rs and show summary info.",
-        {},
-        async () => {
-          const tools = await ida.listTools();
+    server.tool(
+      "ida_status",
+      "Show IDA analysis capacity and active analysis handles. Pass analysis_id to inspect one handle. " +
+      "This status query never starts an ida-mcp-rs worker.",
+      {
+        analysis_id: z.string().optional().describe("Optional analysis handle to inspect"),
+      },
+      async (args) => {
+        const start = Date.now();
+        try {
+          const analysis = args.analysis_id ? ida.inspect(args.analysis_id) : undefined;
           return {
             content: [{
               type: "text" as const,
@@ -689,36 +721,77 @@ export async function createServer(config: ServerConfig) {
                 success: true,
                 tool: "ida_status",
                 data: {
-                  connected: true,
                   mode: config.idaBin ? "stdio" : "http",
                   endpoint: config.idaBin ?? config.idaEndpoint,
-                  tool_count: tools.length,
-                  categories: Object.fromEntries(
-                    Object.entries(IDA_TOOL_CATEGORIES).map(([cat, names]) => [
-                      cat,
-                      names.filter((n) => tools.some((t) => t.name === n)).length,
-                    ]).filter(([, count]) => (count as number) > 0)
-                  ) as Record<string, number>,
+                  active_analyses: ida.activeCount,
+                  opening_analyses: ida.creatingCount,
+                  max_concurrent_analyses: ida.capacity,
+                  tool_catalog_cached: ida.cachedToolCount !== undefined,
+                  tool_count: ida.cachedToolCount ?? null,
+                  ...(analysis ? { analysis } : { analyses: ida.listAnalyses() }),
                 },
-                metadata: { elapsed_ms: 0 },
+                metadata: { elapsed_ms: Date.now() - start },
               }, null, 2),
             }],
           };
-        },
-      );
-    } catch (err) {
-      console.error(
-        `WARNING: failed to connect to ida-mcp-rs via ${modeLabel}: ${err instanceof Error ? err.message : err}\n` +
-        (config.idaBin
-          ? "IDA tools will not be available. Ensure the binary path is correct and ida-mcp-rs can find IDA libraries."
-          : "IDA tools will not be available. Ensure ida-mcp-rs is running with serve-http.")
-      );
-    }
-
-    return { server, idaConnector: ida };
+        } catch (err) {
+          return formatIdaToolError("ida_status", err, start);
+        }
+      },
+    );
   }
 
-  return { server };
+  return {
+    server,
+    runtime: activeRuntime,
+    async close() {
+      await server.close();
+      if (ownsRuntime) await activeRuntime.close();
+    },
+  };
+}
+
+function formatIdaToolResult(
+  name: string,
+  result: Awaited<ReturnType<IdaAnalysisRegistry["callTool"]>>,
+  startedAt: number,
+) {
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: JSON.stringify({
+          success: !result.isError,
+          tool: `ida_${name}`,
+          data: {
+            ...(result.analysisId ? { analysis_id: result.analysisId } : {}),
+            created_analysis: result.created,
+          },
+          metadata: { elapsed_ms: Date.now() - startedAt },
+        }, null, 2),
+      },
+      ...result.content.map((content) => ({
+        type: "text" as const,
+        text: typeof content.text === "string" ? content.text : JSON.stringify(content),
+      })),
+    ],
+    isError: result.isError,
+  };
+}
+
+function formatIdaToolError(tool: string, error: unknown, startedAt: number) {
+  return {
+    content: [{
+      type: "text" as const,
+      text: JSON.stringify({
+        success: false,
+        tool,
+        error: error instanceof Error ? error.message : String(error),
+        metadata: { elapsed_ms: Date.now() - startedAt },
+      }, null, 2),
+    }],
+    isError: true,
+  };
 }
 
 export async function startServer(config: ServerConfig) {
@@ -738,35 +811,121 @@ export async function startServer(config: ServerConfig) {
 
   if (transportMode === "http") {
     await startHttpServer(config);
-  } else {
-    const { server, idaConnector } = await createServer(config);
+    return;
+  }
+
+  const runtime = await createServerRuntime(config);
+  try {
+    const { server } = await createServer(config, runtime);
     const transport = new StdioServerTransport();
     await server.connect(transport);
 
+    let shuttingDown = false;
     const shutdown = async () => {
-      try {
-        await idaConnector?.disconnect();
-      } catch { /* best effort */ }
+      if (shuttingDown) return;
+      shuttingDown = true;
       try {
         await server.close();
+      } catch { /* best effort */ }
+      try {
+        await runtime.close();
       } catch { /* best effort */ }
       process.exit(0);
     };
 
-    process.on("SIGINT", shutdown);
-    process.on("SIGTERM", shutdown);
+    process.once("SIGINT", shutdown);
+    process.once("SIGTERM", shutdown);
 
     const warnings = sandboxOn
       ? ` (upload_from_host confined to ${config.ingestRoot ?? config.samplesDir})`
       : " (WARNING: sandbox disabled)";
     console.error(`REMnux MCP server started${warnings}`);
+  } catch (error) {
+    await runtime.close();
+    throw error;
   }
+}
+
+export async function createHttpApp(
+  config: ServerConfig,
+  runtime?: ServerRuntime,
+): Promise<{ app: ReturnType<typeof createMcpExpressApp>; close(): Promise<void> }> {
+  const host = config.httpHost ?? "127.0.0.1";
+  const token = config.httpToken;
+  const activeRuntime = runtime ?? await createServerRuntime(config);
+  const ownsRuntime = runtime === undefined;
+  const app = createMcpExpressApp({ host });
+
+  if (token) {
+    const tokenBuf = Buffer.from(token);
+    const verifier: OAuthTokenVerifier = {
+      async verifyAccessToken(value: string): Promise<AuthInfo> {
+        const inputBuf = Buffer.from(value);
+        const match = inputBuf.length === tokenBuf.length && timingSafeEqual(inputBuf, tokenBuf);
+        if (!match) throw new Error("Invalid token");
+        return {
+          token: value,
+          clientId: "remnux-client",
+          scopes: [],
+          expiresAt: Math.floor(Date.now() / 1000) + 86400,
+        };
+      },
+    };
+    app.use("/mcp", requireBearerAuth({ verifier }));
+  }
+
+  // Stateless MCP: the bearer token authorizes each request, while IDA state
+  // is selected with analysis_id. Stale Mcp-Session-Id headers are ignored.
+  // A fresh server/transport per request is required by the MCP SDK in this
+  // mode, but both share the process-level REMnux runtime above.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  app.all("/mcp", async (req: any, res: any) => {
+    if (req.method !== "POST") {
+      res.set("Allow", "POST").status(405).end();
+      return;
+    }
+
+    let server: McpServer | undefined;
+    try {
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: undefined,
+      });
+      ({ server } = await createServer(config, activeRuntime));
+      await server.connect(transport);
+      await transport.handleRequest(req, res, req.body);
+    } catch (error) {
+      console.error("MCP request error:", error);
+      if (!res.headersSent) {
+        res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: "Internal error" } });
+      }
+    } finally {
+      try {
+        await server?.close();
+      } catch {
+        // The response has already been handled. A per-request transport close
+        // is best-effort and must not mask the original tool/HTTP result.
+      }
+    }
+  });
+
+  return {
+    app,
+    async close() {
+      if (ownsRuntime) await activeRuntime.close();
+    },
+  };
 }
 
 async function startHttpServer(config: ServerConfig) {
   const host = config.httpHost ?? "127.0.0.1";
   const port = config.httpPort ?? 3000;
   const token = config.httpToken;
+
+  if (config.sessionIdleTtlSecs !== undefined) {
+    console.error(
+      "Warning: --session-idle-ttl / MCP_SESSION_IDLE_TTL_SECS is ignored because HTTP MCP is stateless.",
+    );
+  }
 
   // Fail closed: an HTTP transport bound to a non-loopback address with no auth
   // token is unauthenticated, network-reachable command execution, the one path
@@ -781,131 +940,30 @@ async function startHttpServer(config: ServerConfig) {
     process.exit(1);
   }
 
-  const app = createMcpExpressApp({ host });
-
-  // Bearer token auth middleware
-  if (token) {
-    const tokenBuf = Buffer.from(token);
-    const verifier: OAuthTokenVerifier = {
-      async verifyAccessToken(t: string): Promise<AuthInfo> {
-        const inputBuf = Buffer.from(t);
-        const match = inputBuf.length === tokenBuf.length && timingSafeEqual(inputBuf, tokenBuf);
-        if (!match) {
-          throw new Error("Invalid token");
-        }
-        return { token: t, clientId: "remnux-client", scopes: [], expiresAt: Math.floor(Date.now() / 1000) + 86400 };
-      },
-    };
-    app.use("/mcp", requireBearerAuth({ verifier }));
-  } else {
-    console.error(
-      "WARNING: No auth token configured. Set --http-token or MCP_TOKEN env var for production use."
-    );
-  }
-
-  // Session management: map session ID → transport (capped to prevent memory exhaustion)
-  const MAX_SESSIONS = 100;
-  // Idle-session TTL. 0 (default) = never expire on idle; the session is torn
-  // down only when the transport actually closes (client DELETE, or the
-  // long-lived GET SSE stream's cancel/close). The previous 30-min default
-  // killed sessions still holding an active SSE stream — the main cause of
-  // mid-session disconnects. Tune via --session-idle-ttl <secs> or
-  // MCP_SESSION_IDLE_TTL_SECS. Any positive value restores the old behavior.
-  const SESSION_IDLE_TTL_MS = (config.sessionIdleTtlSecs ?? 0) * 1000;
-  const sessions = new Map<string, StreamableHTTPServerTransport>();
-  const sessionTimers = new Map<string, ReturnType<typeof setTimeout>>();
-
-  function resetSessionTimer(sessionId: string) {
-    if (SESSION_IDLE_TTL_MS <= 0) return;
-    const existing = sessionTimers.get(sessionId);
-    if (existing) clearTimeout(existing);
-    sessionTimers.set(sessionId, setTimeout(() => {
-      const transport = sessions.get(sessionId);
-      if (transport) {
-        transport.close?.();
-        sessions.delete(sessionId);
-      }
-      sessionTimers.delete(sessionId);
-    }, SESSION_IDLE_TTL_MS));
-  }
-
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  app.all("/mcp", async (req: any, res: any) => {
-    try {
-      const sessionId = req.headers["mcp-session-id"] as string | undefined;
-
-      // Reuse existing transport for established sessions
-      if (sessionId && sessions.has(sessionId)) {
-        const transport = sessions.get(sessionId)!;
-        resetSessionTimer(sessionId);
-        await transport.handleRequest(req, res, req.body);
-        return;
-      }
-
-      if (sessions.size >= MAX_SESSIONS) {
-        res.status(503).json({ jsonrpc: "2.0", error: { code: -32000, message: "Too many active sessions" } });
-        return;
-      }
-
-      // New session: create transport and server
-      const transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => randomUUID(),
-      });
-
-      const { server, idaConnector } = await createServer(config);
-      await server.connect(transport);
-
-      // Tie the IDA sub-connection's lifetime to this HTTP session: when the
-      // session's transport closes (client DELETE, idle TTL, or the GET SSE
-      // stream cancels), disconnect the ida-mcp-rs child/link this session
-      // owns. Without this, each closed session leaks an ida-mcp-rs connection
-      // (a stdio child process, or an orphaned HTTP session id).
-      transport.onclose = () => {
-        if (transport.sessionId) {
-          sessions.delete(transport.sessionId);
-          const timer = sessionTimers.get(transport.sessionId);
-          if (timer) {
-            clearTimeout(timer);
-            sessionTimers.delete(transport.sessionId);
-          }
-        }
-        idaConnector?.disconnect().catch(() => { /* best-effort */ });
-      };
-
-      await transport.handleRequest(req, res, req.body);
-
-      // Store session after handling (session ID is set during initialize)
-      if (transport.sessionId) {
-        sessions.set(transport.sessionId, transport);
-        resetSessionTimer(transport.sessionId);
-      }
-    } catch (err) {
-      console.error("MCP request error:", err);
-      if (!res.headersSent) {
-        res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: "Internal error" } });
-      }
-    }
-  });
-
+  const { app, close } = await createHttpApp(config);
   const warnings = !(config.noSandbox ?? false)
     ? ` (upload_from_host confined to ${config.ingestRoot ?? config.samplesDir})`
     : " (WARNING: sandbox disabled)";
   const authStatus = token ? "auth enabled" : "NO AUTH";
 
-  return new Promise<void>((resolve) => {
+  await new Promise<void>((resolve) => {
     const httpServer = app.listen(port, host, () => {
       console.error(
-        `REMnux MCP server started${warnings} — HTTP ${authStatus} at http://${host}:${port}/mcp`
+        `REMnux MCP server started${warnings} — HTTP ${authStatus} at http://${host}:${port}/mcp ` +
+        "(stateless MCP; GET/DELETE are disabled)",
       );
       resolve();
     });
-    // Keep long-lived GET SSE streams alive. Node's per-request idle timeouts
-    // (requestTimeout 5 min, headersTimeout 60 s, keepAliveTimeout 5 s) would
-    // otherwise drop an idle-but-open SSE stream between tool calls. With
-    // session-idle TTL disabled by default, there is no server-side reason to
-    // cut these connections, so disable the kill switches.
-    httpServer.requestTimeout = 0;
-    httpServer.headersTimeout = 0;
-    httpServer.keepAliveTimeout = 0;
+
+    let shuttingDown = false;
+    const shutdown = async () => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      await new Promise<void>((done) => httpServer.close(() => done()));
+      await close();
+      process.exit(0);
+    };
+    process.once("SIGINT", shutdown);
+    process.once("SIGTERM", shutdown);
   });
 }

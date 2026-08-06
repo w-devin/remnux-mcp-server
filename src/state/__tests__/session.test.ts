@@ -1,7 +1,8 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { SessionState } from "../session.js";
 
 describe("SessionState", () => {
+  afterEach(() => { vi.useRealTimers(); });
   it("stores and retrieves archive info by archive filename", () => {
     const state = new SessionState();
     state.storeArchiveInfo("sample.7z", ["payload.exe", "readme.txt"], "7z", "malware");
@@ -42,4 +43,31 @@ describe("SessionState", () => {
     const info = state.getArchiveInfo("file.exe");
     expect(info).toEqual({ format: "7z", password: "pass2" });
   });
+
+  it("expires metadata after its configured TTL", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+    const state = new SessionState(100, 1_000);
+    state.storeArchiveInfo("sample.zip", ["payload.exe"], "zip", "infected");
+
+    vi.advanceTimersByTime(1_001);
+    expect(state.getArchiveInfo("payload.exe")).toBeUndefined();
+  });
+});
+
+it("normalizes slash styles before storing and looking up archive metadata", () => {
+  const state = new SessionState();
+  state.storeArchiveInfo("archives\\sample.zip", ["nested\\payload.exe"], "zip", "infected");
+
+  expect(state.getArchiveInfo("archives/sample.zip")).toEqual({ format: "zip", password: "infected" });
+  expect(state.getArchiveInfo("nested/payload.exe")).toEqual({ format: "zip", password: "infected" });
+});
+
+it("evicts least-recently-stored entries when the bounded cache is full", () => {
+  const state = new SessionState(2);
+  state.storeArchiveInfo("a.zip", ["a.exe"], "zip", "one");
+  state.storeArchiveInfo("b.zip", ["b.exe"], "7z", "two");
+
+  expect(state.getArchiveInfo("a.exe")).toBeUndefined();
+  expect(state.getArchiveInfo("b.exe")).toEqual({ format: "7z", password: "two" });
 });

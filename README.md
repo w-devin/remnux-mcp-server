@@ -113,10 +113,9 @@ When both REMnux analysis tools and IDA Pro reverse engineering capabilities are
 |  Cursor, etc)  |<---- single endpoint ---|  REMnux tools (16):                    |
 +----------------+                         |    analyze_file, run_tool, ...         |
                                            |                                        |
-                                           |  IDA tools (71, ida_ prefix):          |
-                                           |    ida_open_idb, ida_decompile,        |
-                                           |    ida_list_functions, ida_xrefs_to,   |
-                                           |    ida_disasm, ida_find_bytes, ...     |
+                                           |  IDA MCP adapter:                       |
+                                           |    ida_tool, ida_tools_list,           |
+                                           |    ida_status                           |
                                            |                                        |
                                            |  + ida_status (connection health)      |
                                            +----------------|------------------------+
@@ -262,6 +261,8 @@ claude mcp add remnux --transport http http://REMNUX_IP:3000/mcp \
 - **Use `MCP_TOKEN` env var** to avoid exposing the token in process listings.
 - **For HTTPS**, place a reverse proxy (nginx, caddy) in front of the MCP server. The bearer token travels in plaintext over HTTP without this.
 - **DNS rebinding protection** is automatically enabled when binding to localhost.
+- **HTTP MCP is stateless.** The bearer token authorizes every request; this server does not issue or require `Mcp-Session-Id`. A client may continue to send a stale session header after reconnecting or after a server restart, and REMnux tool calls will still be processed.
+- **POST only.** `GET /mcp` and `DELETE /mcp` return `405 Method Not Allowed`; server-initiated SSE is disabled. `--session-idle-ttl` and `MCP_SESSION_IDLE_TTL_SECS` are retained only as ignored compatibility settings.
 
 ### Scenario 4: With IDA Pro Integration
 
@@ -271,7 +272,7 @@ Connect to [ida-mcp-rs](https://github.com/blacktop/ida-mcp-rs) to expose IDA Pr
 
 | Mode | Flag | How it works | When to use |
 |------|------|-------------|-------------|
-| **Stdio** (recommended) | `--ida-bin=<path>` | remnux-mcp-server spawns ida-mcp-rs as a child process, communicates over stdin/stdout. Auto-started on first tool call, killed on server shutdown. | ida-mcp-rs is installed on the same machine |
+| **Stdio** (recommended) | `--ida-bin=<path>` | remnux-mcp-server starts a separate ida-mcp-rs child only when an analysis is opened, then communicates over stdin/stdout. Each active analysis has its own worker. | ida-mcp-rs is installed on the same machine |
 | **HTTP** | `--ida-endpoint=<url>` | Connects to an already-running ida-mcp-rs instance via Streamable HTTP. | ida-mcp-rs runs on a different host, or you want to share it with other clients |
 
 **Prerequisites:**
@@ -298,11 +299,40 @@ npx @remnux/mcp-server --ida-endpoint=http://IDA_HOST:8765 \
   --ida-token=IDA_SECRET
 ```
 
-When `--ida-bin` is set, ida-mcp-rs is spawned in its default stdio mode — no HTTP port needed, no separate process to manage. The child process inherits the parent's environment, so `IDADIR`, `DYLD_LIBRARY_PATH`, and `LD_LIBRARY_PATH` are passed through automatically.
+When `--ida-bin` is set, ida-mcp-rs workers use their default stdio mode — no HTTP port needed. Each opened analysis gets one isolated worker; the worker is released by `close_idb`, when the upstream connection closes unexpectedly, or when the server shuts down. Child processes inherit the parent's environment, so `IDADIR`, `DYLD_LIBRARY_PATH`, and `LD_LIBRARY_PATH` are passed through automatically.
+
+#### IDA analysis handles and concurrent agents
+
+The outer MCP connection is stateless, but an opened IDB is not. Start each analysis through the `ida_tool` meta-tool using `open_idb` or `open_dsc`; the response returns an `analysis_id`. Include that handle in every later IDA call for that sample:
+
+```jsonc
+// 1. Open a sample. Save the returned data.analysis_id.
+{
+  "name": "ida_tool",
+  "arguments": {
+    "name": "open_idb",
+    "arguments": { "path": "/samples/sample-a.exe" }
+  }
+}
+
+// 2. Run an operation against that exact IDB.
+{
+  "name": "ida_tool",
+  "arguments": {
+    "analysis_id": "returned-analysis-id",
+    "name": "decompile",
+    "arguments": { "addr": "0x401000" }
+  }
+}
+```
+
+This prevents two agents analyzing different samples from sharing a worker or IDB. For compatibility, an omitted `analysis_id` is accepted only while exactly one analysis is active; when several analyses are open it is required. Always call `close_idb` through `ida_tool` as soon as the sample is finished so its capacity is released.
+
+The default limit is **two** simultaneously open analyses. Set `--ida-max-concurrent-analyses=<n>` or `IDA_MCP_MAX_CONCURRENT_ANALYSES=<n>` to match the available IDA licenses, RAM, and CPU. On higher-concurrency deployments, prefer `--ida-endpoint` connected to an ida-mcp-rs service configured with an appropriate worker capacity instead of allowing unbounded local stdio children.
 
 **Filtering IDA tools:**
 
-By default all 71 IDA tools are exposed. Use `--ida-toolsets` to expose only specific categories:
+The MCP endpoint exposes the three IDA meta-tools `ida_tool`, `ida_tools_list`, and `ida_status`. `ida_tools_list` lazily discovers the upstream ida-mcp-rs catalog (up to 71 tools) without opening an IDB; use `ida_tool` to invoke one. `--ida-toolsets` limits which upstream tools appear in that catalog and can be called:
 
 ```bash
 npx @remnux/mcp-server --ida-bin=/usr/local/bin/ida-mcp \
@@ -336,11 +366,11 @@ npx @remnux/mcp-server --ida-bin=/usr/local/bin/ida-mcp \
 
 #### Notes on IDA Integration
 
-- **Stdio mode manages the child lifecycle.** The ida-mcp-rs process is spawned lazily (on first `ida_*` tool call) and killed when the server shuts down. No separate process management needed.
-- **HTTP mode requires a running instance.** If ida-mcp-rs is not reachable at startup, a warning is logged and REMnux tools still work normally. IDA tools become available once ida-mcp-rs starts.
+- **Stdio mode manages each analysis child lifecycle.** An ida-mcp-rs process starts only when `open_idb`/`open_dsc` is called, and is disconnected after `close_idb` or server shutdown. The configured analysis limit bounds both open and still-opening children.
+- **HTTP mode connects lazily.** REMnux tools initialize independently of ida-mcp-rs; use `ida_tools_list` or `open_idb` after the upstream service is reachable.
 - **ida-mcp-rs must have IDA Pro / idalib.** It links against IDA's headless SDK at build time and loads IDA libraries at runtime. See [ida-mcp-rs building docs](https://github.com/blacktop/ida-mcp-rs/blob/main/docs/BUILDING.md).
 - **Timeout coordination.** The `--ida-timeout` flag (default 600s) controls per-tool-call timeouts to ida-mcp-rs. Set it higher than the longest expected IDA operation (e.g., decompiling a large binary).
-- **Tool descriptions are from ida-mcp-rs.** The `ida_*` tools carry their original descriptions from ida-mcp-rs, prefixed with `[Proxied to IDA Pro via ida-mcp-rs]`. Use `ida_tool_catalog` or `ida_tool_help` for detailed docs.
+- **Tool descriptions are from ida-mcp-rs.** Call `ida_tools_list` for upstream descriptions and parameter schemas, then call the selected upstream tool through `ida_tool`.
 - **No changes to ida-mcp-rs needed.** This integration uses ida-mcp-rs's standard MCP interface (stdio or HTTP) — no patches or forks required.
 
 ## CLI Options
@@ -370,6 +400,9 @@ npx @remnux/mcp-server --ida-bin=/usr/local/bin/ida-mcp \
 | `--ida-timeout` | Per-IDA-tool-call timeout in seconds | `600` |
 | `--ida-toolsets` | Comma-separated IDA toolset categories to expose (e.g. `core,functions,disasm`). Omit to expose all | all |
 | `--ida-exclude-tools` | Comma-separated IDA tool names to exclude from exposure | - |
+| `--ida-max-concurrent-analyses` | Maximum simultaneously open IDA analysis contexts (also reads `IDA_MCP_MAX_CONCURRENT_ANALYSES`) | `2` |
+| `--ida-debug` | Log detailed ida-mcp-rs requests and responses to stderr (also reads `IDA_MCP_DEBUG`) | off |
+| `--remnux-debug` | Log REMnux tool start/completion/error events to stderr; debug output redacts secrets and truncates previews (also reads `REMNUX_MCP_DEBUG`) | off |
 
 ## MCP Tools
 
@@ -394,25 +427,15 @@ npx @remnux/mcp-server --ida-bin=/usr/local/bin/ida-mcp \
 | `get_report_guidance` | Return bundled report writing guidelines (sections, confidence, capabilities, IOC tiering, anti-patterns); `topic` narrows the digest, or `topic='triage_checklist'` returns the pre-claim artifact-vs-behavior triage discipline checklist |
 | `get_osint_guidance` | Return bundled, offline OSINT triage guidance for malware indicators. Enrichment tradecraft (hash-first, disclosure-aware, do-not-tip-off-the-adversary, leads-not-verdicts) plus a curated, PR-maintained catalog of free and freemium lookup services. `topic` selects the guidance slice, `ioc_type` narrows the catalog. Makes no network calls and holds no API keys |
 
-### IDA Pro Tools (when `--ida-endpoint` is set)
+### IDA Pro Tools (when `--ida-bin` or `--ida-endpoint` is set)
 
-When connected to an ida-mcp-rs instance, the following IDA tools are automatically registered with the `ida_` prefix. They proxy to ida-mcp-rs over MCP HTTP — no IDA-specific code runs inside remnux-mcp-server.
+IDA is exposed through three MCP meta-tools rather than one registration per upstream operation. This keeps HTTP MCP stateless while retaining explicit, bounded IDB state:
 
-| Category | `ida_*` Tools | Description |
-|----------|---------------|-------------|
-| **core** | `open_idb`, `open_dsc`, `close_idb`, `load_debug_info`, `analysis_status`, `idb_meta`, `tool_catalog`, `tool_help`, `recent_operations`, `task_status` | Database lifecycle, discovery, and meta-tools |
-| **functions** | `list_functions`, `resolve_function`, `function_at`, `lookup_funcs`, `analyze_funcs` | Function navigation and discovery |
-| **disassembly** | `disasm`, `disasm_by_name`, `disasm_function_at` | Disassembly listing |
-| **decompile** | `decompile`, `pseudocode_at` | Hex-Rays decompilation (requires Hex-Rays license) |
-| **xrefs** | `xrefs_to`, `xrefs_from`, `xrefs_to_string`, `xref_matrix`, `xrefs_to_field` | Cross-reference analysis |
-| **control flow** | `basic_blocks`, `callers`, `callees`, `callgraph`, `find_paths` | CFG and call graph analysis |
-| **memory** | `get_bytes`, `get_string`, `get_u8/u16/u32/u64`, `get_global_value`, `int_convert` | Memory and data reading |
-| **search** | `find_bytes`, `search`, `strings`, `find_string`, `analyze_strings`, `find_insns`, `find_insn_operands` | Pattern and string search |
-| **metadata** | `segments`, `addr_info`, `imports`, `exports`, `export_funcs`, `entrypoints`, `list_globals` | Binary structure info |
-| **types** | `local_types`, `declare_type`, `apply_types`, `infer_types`, `stack_frame`, `structs`, `struct_info`, `read_struct`, `search_structs` | Type system and structs |
-| **editing** | `set_comments`, `patch_asm`, `patch`, `rename` | Database mutation |
-| **scripting** | `run_script` | IDAPython execution |
-| **meta** | `ida_status` | Connection health and tool listing (added by remnux-mcp-server) |
+| Tool | Description |
+|------|-------------|
+| `ida_tools_list` | Lazily obtain the available ida-mcp-rs tool catalog, descriptions, and parameter schemas. It does not open an IDB. |
+| `ida_tool` | Invoke an upstream IDA operation by `name`. `open_idb`/`open_dsc` returns an `analysis_id`; pass it for later operations and for `close_idb`. |
+| `ida_status` | Show capacity, active handles, currently opening analyses, and catalog-cache state without starting a worker. |
 
 ### Key Behaviors
 

@@ -21,6 +21,20 @@ function parseIntOrExit(value: string, flag: string): number {
   return n;
 }
 
+function parsePositiveIntOrExit(value: string, flag: string): number {
+  const n = parseIntOrExit(value, flag);
+  if (!Number.isInteger(n) || n < 1) {
+    console.error(`Error: ${flag} must be a positive integer: ${value}`);
+    process.exit(1);
+  }
+  return n;
+}
+
+function envFlagEnabled(value: string | undefined): boolean {
+  if (!value) return false;
+  return ["1", "true", "yes", "on"].includes(value.toLowerCase());
+}
+
 function parseArgs(): ServerConfig {
   const args = process.argv.slice(2);
   const config: ServerConfig = {
@@ -153,6 +167,16 @@ function parseArgs(): ServerConfig {
       case "--ida-debug":
         config.idaDebug = true;
         break;
+      case "--ida-max-concurrent-analyses":
+        config.idaMaxConcurrentAnalyses = parsePositiveIntOrExit(
+          value,
+          "--ida-max-concurrent-analyses",
+        );
+        consumeValue();
+        break;
+      case "--remnux-debug":
+        config.remnuxDebug = true;
+        break;
       case "--session-idle-ttl":
         config.sessionIdleTtlSecs = parseIntOrExit(value, "--session-idle-ttl");
         consumeValue();
@@ -182,9 +206,20 @@ function parseArgs(): ServerConfig {
   }
   // Enable IDA traffic debug via env var (1/true/yes), mirroring --ida-debug.
   // Useful for MCP clients (Claude Desktop) where you can't easily add CLI flags.
-  if (!config.idaDebug && process.env.IDA_MCP_DEBUG) {
-    const v = process.env.IDA_MCP_DEBUG.toLowerCase();
-    config.idaDebug = v === "1" || v === "true" || v === "yes" || v === "on";
+  if (!config.idaDebug) {
+    config.idaDebug = envFlagEnabled(process.env.IDA_MCP_DEBUG);
+  }
+  if (!config.remnuxDebug) {
+    config.remnuxDebug = envFlagEnabled(process.env.REMNUX_MCP_DEBUG);
+  }
+  if (
+    config.idaMaxConcurrentAnalyses === undefined &&
+    process.env.IDA_MCP_MAX_CONCURRENT_ANALYSES
+  ) {
+    config.idaMaxConcurrentAnalyses = parsePositiveIntOrExit(
+      process.env.IDA_MCP_MAX_CONCURRENT_ANALYSES,
+      "IDA_MCP_MAX_CONCURRENT_ANALYSES",
+    );
   }
   if (config.sessionIdleTtlSecs === undefined && process.env.MCP_SESSION_IDLE_TTL_SECS) {
     config.sessionIdleTtlSecs = parseIntOrExit(
@@ -250,10 +285,14 @@ PROXY MODE (for Claude Desktop):
                           content to stderr (for diagnosing disconnects / bad
                           tool output). Also reads IDA_MCP_DEBUG env var
                           (1/true/yes/on)
-  --session-idle-ttl <s>  Idle-session TTL in seconds for HTTP transport (default: 0
-                          = never expire on idle; torn down only when the
-                          connection actually closes). Also reads
-                          MCP_SESSION_IDLE_TTL_SECS env var
+  --ida-max-concurrent-analyses <n>
+                          Maximum simultaneous IDA analysis contexts (default: 2).
+                          Also reads IDA_MCP_MAX_CONCURRENT_ANALYSES env var
+  --remnux-debug          Log REMnux tool start/completion/error events to stderr;
+                          include redacted request/response previews. Also reads
+                          REMNUX_MCP_DEBUG env var (1/true/yes/on)
+  --session-idle-ttl <s>  Deprecated compatibility option. Ignored for stateless
+                          HTTP MCP. MCP_SESSION_IDLE_TTL_SECS is also ignored
   -h, --help              Show this help message
   -v, --version           Show version
 
