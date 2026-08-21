@@ -14,6 +14,7 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
   type CallToolResult,
+  type Progress,
 } from "@modelcontextprotocol/sdk/types.js";
 
 export interface ProxyConfig {
@@ -73,13 +74,26 @@ export async function startProxy(config: ProxyConfig): Promise<void> {
 
   // Forward each tool call to the remote server and return its result verbatim
   // (keeps non-text content like images intact).
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     const { name, arguments: args } = request.params;
     try {
-      const result = (await remoteClient.callTool({
-        name,
-        arguments: args,
-      })) as CallToolResult;
+      const progressToken = request.params._meta?.progressToken;
+      const result = (await remoteClient.callTool(
+        {
+          name,
+          arguments: args,
+        },
+        undefined,
+        progressToken === undefined ? undefined : {
+          onprogress: async (progress: Progress) => {
+            await extra.sendNotification({
+              method: "notifications/progress",
+              params: { progressToken, ...progress },
+            });
+          },
+          resetTimeoutOnProgress: true,
+        },
+      )) as CallToolResult;
       return result;
     } catch (err) {
       return {

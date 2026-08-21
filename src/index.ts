@@ -54,6 +54,7 @@ import { OPTIONAL_SECTION_CONVENTION } from "./report/optional-sections.js";
 import { httpBindRequiresToken } from "./utils/loopback.js";
 import type { IdaConnectorConfig } from "./connectors/ida.js";
 import { IdaAnalysisRegistry } from "./ida/analysis-registry.js";
+import { withProgressHeartbeat } from "./ida/progress.js";
 import { withRemnuxToolLogging } from "./logging/remnux.js";
 
 /** ida-mcp-rs tool category → tool name list (for --ida-toolsets filtering) */
@@ -629,19 +630,23 @@ export async function createServer(config: ServerConfig, runtime?: ServerRuntime
         name: z.string().describe("IDA tool name (e.g. 'open_idb', 'decompile', 'list_functions')"),
         arguments: z.record(z.unknown()).optional().describe("Tool-specific parameters as key-value pairs"),
       },
-      async (args) => {
+      withRemnuxToolLogging("ida_tool", logOptions, async (args, extra) => {
         const start = Date.now();
         try {
-          const result = await ida.callTool(
-            args.analysis_id,
-            args.name,
-            (args.arguments ?? {}) as Record<string, unknown>,
+          const result = await withProgressHeartbeat(
+            extra,
+            { tool: args.name, analysisId: args.analysis_id },
+            () => ida.callTool(
+              args.analysis_id,
+              args.name,
+              (args.arguments ?? {}) as Record<string, unknown>,
+            ),
           );
           return formatIdaToolResult(args.name, result, start);
         } catch (err) {
           return formatIdaToolError(`ida_${args.name}`, err, start);
         }
-      },
+      }),
     );
 
     server.tool(
@@ -658,7 +663,7 @@ export async function createServer(config: ServerConfig, runtime?: ServerRuntime
         ),
         query: z.string().optional().describe("Search tool names and descriptions (substring match)"),
       },
-      async (args) => {
+      withRemnuxToolLogging("ida_tools_list", logOptions, async (args) => {
         const start = Date.now();
         try {
           const tools = await ida.listTools(args.analysis_id);
@@ -700,17 +705,17 @@ export async function createServer(config: ServerConfig, runtime?: ServerRuntime
         } catch (err) {
           return formatIdaToolError("ida_tools_list", err, start);
         }
-      },
+      }),
     );
 
     server.tool(
       "ida_status",
-      "Show IDA analysis capacity and active analysis handles. Pass analysis_id to inspect one handle. " +
-      "This status query never starts an ida-mcp-rs worker.",
+      "Show IDA capacity, database openings, worker connection details, and current/last operations. " +
+      "Pass analysis_id to inspect one handle. This local status query never starts or calls an ida-mcp-rs worker.",
       {
         analysis_id: z.string().optional().describe("Optional analysis handle to inspect"),
       },
-      async (args) => {
+      withRemnuxToolLogging("ida_status", logOptions, async (args) => {
         const start = Date.now();
         try {
           const analysis = args.analysis_id ? ida.inspect(args.analysis_id) : undefined;
@@ -725,6 +730,7 @@ export async function createServer(config: ServerConfig, runtime?: ServerRuntime
                   endpoint: config.idaBin ?? config.idaEndpoint,
                   active_analyses: ida.activeCount,
                   opening_analyses: ida.creatingCount,
+                  openings: ida.listOpenings(),
                   max_concurrent_analyses: ida.capacity,
                   tool_catalog_cached: ida.cachedToolCount !== undefined,
                   tool_count: ida.cachedToolCount ?? null,
@@ -737,7 +743,7 @@ export async function createServer(config: ServerConfig, runtime?: ServerRuntime
         } catch (err) {
           return formatIdaToolError("ida_status", err, start);
         }
-      },
+      }),
     );
   }
 

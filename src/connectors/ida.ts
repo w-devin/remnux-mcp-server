@@ -23,6 +23,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 
 export interface IdaConnectorConfig {
@@ -75,6 +76,9 @@ export class IdaConnector {
   private closing = false;
   /** Monotonic counter for each connect attempt — correlates rebuilds in logs. */
   private connectAttempt = 0;
+  private childPid: number | undefined;
+  private lastCloseAt: number | undefined;
+  private lastCloseReason: string | undefined;
   private readonly mode: "stdio" | "http";
   private readonly config: IdaConnectorConfig & { timeout: number };
 
@@ -177,11 +181,15 @@ export class IdaConnector {
         const wasAlive = this.clientAlive;
         this.clientAlive = false;
         if (this.closing) {
+          this.lastCloseAt = Date.now();
+          this.lastCloseReason = "clean shutdown";
           log(`onclose: client closed by disconnect() (clean shutdown)`);
         } else {
           // This is THE disconnect signal — an unexpected transport death.
           // Stateful callers can release their analysis handle here rather
           // than reconnecting to a fresh worker with no IDB loaded.
+          this.lastCloseAt = Date.now();
+          this.lastCloseReason = `transport died unexpectedly (wasAlive=${wasAlive})`;
           log(`onclose: transport died unexpectedly (wasAlive=${wasAlive}); client marked dead`);
           this.config.onUnexpectedClose?.();
         }
@@ -197,6 +205,7 @@ export class IdaConnector {
       this.clientAlive = true;
       if (this.mode === "stdio") {
         const pid = (this.transport as StdioClientTransport).pid;
+        this.childPid = pid ?? undefined;
         log(`connect #${attempt} ok: stdio child pid=${pid ?? "?"}`);
       } else {
         log(`connect #${attempt} ok: HTTP connected to ${this.config.endpoint}`);
@@ -277,34 +286,69 @@ export class IdaConnector {
     await this.connect();
 
     const startedAt = Date.now();
+    const callId = randomCallId();
     const argKeys = Object.keys(args);
-    // A start line with no matching completion line means the call is still
-    // in-flight or hung — critical for correlating a hang with a disconnect.
-    log(`callTool '${name}' -> ida-mcp-rs (arg keys: ${argKeys.length ? argKeys.join(", ") : "none"})`);
-    if (this.config.debug) debugLog(`callTool '${name}' request args`, args);
-    const result = await this.client!.callTool(
-      { name, arguments: args },
-      undefined,
-      { timeout: this.config.timeout },
+    log(
+      `callTool '${name}' -> ida-mcp-rs call=${callId} mode=${this.mode} pid=${this.childPid ?? "-"} ` +
+      `(arg keys: ${argKeys.length ? argKeys.join(", ") : "none"})`,
     );
-    log(`callTool '${name}' <- ida-mcp-rs done in ${Date.now() - startedAt}ms (isError=${result.isError ?? false})`);
-    if (this.config.debug) {
-      // result is the SDK's CallToolResult union; normalise to the shape
-      // dumpCallToolResponse expects. content may be absent in legacy form.
-      dumpCallToolResponse(name, result as {
-        content?: Array<{ type: string; text?: string; [k: string]: unknown }>;
-        isError?: boolean;
-      });
-    }
+    if (this.config.debug) debugLog(`callTool '${name}' call=${callId} request args`, args);
+    const heartbeat = setInterval(() => {
+      log(`callTool '${name}' still running call=${callId} elapsed_ms=${Date.now() - startedAt}`);
+    }, 30_000);
+    heartbeat.unref?.();
 
-    // The SDK returns either the new format ({ content, isError }) or the
-    // legacy compatibility format ({ toolResult }). Normalise to new format.
-    if ("content" in result) {
-      return result as { content: Array<{ type: string; text?: string; [k: string]: unknown }>; isError?: boolean };
+    try {
+      const result = await this.client!.callTool(
+        { name, arguments: args },
+        undefined,
+        { timeout: this.config.timeout },
+      );
+      log(
+        `callTool '${name}' <- ida-mcp-rs done call=${callId} elapsed_ms=${Date.now() - startedAt} ` +
+        `(isError=${result.isError ?? false})`,
+      );
+      if (this.config.debug) {
+        dumpCallToolResponse(name, result as {
+          content?: Array<{ type: string; text?: string; [k: string]: unknown }>;
+          isError?: boolean;
+        });
+      }
+
+      if ("content" in result) {
+        return result as { content: Array<{ type: string; text?: string; [k: string]: unknown }>; isError?: boolean };
+      }
+      return {
+        content: [{ type: "text", text: JSON.stringify((result as { toolResult: unknown }).toolResult) }],
+      };
+    } catch (error) {
+      log(
+        `callTool '${name}' !! failed call=${callId} elapsed_ms=${Date.now() - startedAt}: ` +
+        describeError(error),
+      );
+      throw error;
+    } finally {
+      clearInterval(heartbeat);
     }
-    // Legacy path — wrap toolResult as text content
+  }
+
+  getStatus(): {
+    mode: "stdio" | "http";
+    connected: boolean;
+    connecting: boolean;
+    child_pid?: number;
+    connect_attempts: number;
+    last_close_at?: string;
+    last_close_reason?: string;
+  } {
     return {
-      content: [{ type: "text", text: JSON.stringify((result as { toolResult: unknown }).toolResult) }],
+      mode: this.mode,
+      connected: this.clientAlive,
+      connecting: this.connecting !== null,
+      ...(this.childPid !== undefined ? { child_pid: this.childPid } : {}),
+      connect_attempts: this.connectAttempt,
+      ...(this.lastCloseAt ? { last_close_at: new Date(this.lastCloseAt).toISOString() } : {}),
+      ...(this.lastCloseReason ? { last_close_reason: this.lastCloseReason } : {}),
     };
   }
 
@@ -368,6 +412,10 @@ function isDeadConnection(err: unknown): boolean {
 // for the MCP protocol. The `[IDA]` prefix + ISO timestamp makes the
 // disconnect timeline greppable: `rg '\[IDA' <stderr-log>`.
 
+function randomCallId(): string {
+  return randomUUID().slice(0, 8);
+}
+
 function ts(): string {
   return new Date().toISOString();
 }
@@ -391,12 +439,13 @@ function describeError(err: unknown): string {
  *  decompilation output can be tens of KB; printing it whole would drown the
  *  log. Keep a generous preview and report the total length. */
 const DEBUG_TEXT_BUDGET = 2000;
+const SENSITIVE_KEY = /(authorization|token|password|secret|api[_-]?key)/i;
 
 /** Debug-mode helper: dump an arbitrary value as pretty JSON, truncating
  *  long strings to keep the log readable. Used for request args and tool
  *  lists. */
 function debugLog(label: string, value: unknown): void {
-  const json = safeStringify(value);
+  const json = safeStringify(redact(value));
   const body = json.length > DEBUG_TEXT_BUDGET
     ? `${json.slice(0, DEBUG_TEXT_BUDGET)} …(${json.length} chars total, truncated)`
     : json;
@@ -424,6 +473,19 @@ function dumpCallToolResponse(
       : text;
     log(`[debug]   [${i}] type=${item.type} text=${preview}`);
   }
+}
+
+function redact(value: unknown, seen = new WeakSet<object>()): unknown {
+  if (value === null || typeof value !== "object") return value;
+  if (seen.has(value)) return "[circular]";
+  seen.add(value);
+  if (Array.isArray(value)) return value.map((item) => redact(item, seen));
+
+  const output: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value)) {
+    output[key] = SENSITIVE_KEY.test(key) ? "[REDACTED]" : redact(item, seen);
+  }
+  return output;
 }
 
 /** JSON.stringify that never throws on circular input (falls back to a

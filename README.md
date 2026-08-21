@@ -328,6 +328,17 @@ The outer MCP connection is stateless, but an opened IDB is not. Start each anal
 
 This prevents two agents analyzing different samples from sharing a worker or IDB. For compatibility, an omitted `analysis_id` is accepted only while exactly one analysis is active; when several analyses are open it is required. Always call `close_idb` through `ida_tool` as soon as the sample is finished so its capacity is released.
 
+Use `ida_status` at any time to inspect local state without sending another request to a potentially busy IDA worker:
+
+```jsonc
+{
+  "name": "ida_status",
+  "arguments": { "analysis_id": "returned-analysis-id" }
+}
+```
+
+Each analysis reports `state` (`idle` or `busy`), worker connection state and child PID (stdio mode), `current_operations` with elapsed times, and `last_operation`. The top-level `openings` array reports databases that are still opening. A `busy` operation means remnux-mcp-server is still waiting for ida-mcp-rs; it cannot prove whether the upstream operation is actively computing or queued behind another IDA operation. Because this status is maintained locally, it remains responsive even when the IDA worker cannot service `task_status`.
+
 The default limit is **two** simultaneously open analyses. Set `--ida-max-concurrent-analyses=<n>` or `IDA_MCP_MAX_CONCURRENT_ANALYSES=<n>` to match the available IDA licenses, RAM, and CPU. On higher-concurrency deployments, prefer `--ida-endpoint` connected to an ida-mcp-rs service configured with an appropriate worker capacity instead of allowing unbounded local stdio children.
 
 **Filtering IDA tools:**
@@ -369,7 +380,9 @@ npx @remnux/mcp-server --ida-bin=/usr/local/bin/ida-mcp \
 - **Stdio mode manages each analysis child lifecycle.** An ida-mcp-rs process starts only when `open_idb`/`open_dsc` is called, and is disconnected after `close_idb` or server shutdown. The configured analysis limit bounds both open and still-opening children.
 - **HTTP mode connects lazily.** REMnux tools initialize independently of ida-mcp-rs; use `ida_tools_list` or `open_idb` after the upstream service is reachable.
 - **ida-mcp-rs must have IDA Pro / idalib.** It links against IDA's headless SDK at build time and loads IDA libraries at runtime. See [ida-mcp-rs building docs](https://github.com/blacktop/ida-mcp-rs/blob/main/docs/BUILDING.md).
-- **Timeout coordination.** The `--ida-timeout` flag (default 600s) controls per-tool-call timeouts to ida-mcp-rs. Set it higher than the longest expected IDA operation (e.g., decompiling a large binary).
+- **Timeout coordination.** The `--ida-timeout` flag (default 600s) controls per-tool-call timeouts from this server to ida-mcp-rs. It is separate from an AI client's tool-idle timeout. `ida_tool` sends an MCP progress heartbeat every 30 seconds when the client supplies a progress token, including through the bundled stdio-to-HTTP proxy. Clients that do not request or honor MCP progress must set their idle timeout above the longest expected IDA operation; for Claude Code, raise `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` (milliseconds) or set it to `0` for no idle limit.
+- **Background analysis caveat.** Some ida-mcp-rs versions may log a background task ID but delay the original `analyze_funcs(background=true)` response until IDA yields. During that interval, use the local `ida_status` state instead of repeatedly submitting `analyze_funcs`; upstream `task_status` may itself queue behind the analysis.
+- **Diagnostics.** Every IDA call logs a call ID, transport/PID, completion or failure, and a 30-second server-side heartbeat to stderr. `--ida-debug` / `IDA_MCP_DEBUG=1` adds bounded request and response previews. `--remnux-debug` / `REMNUX_MCP_DEBUG=1` adds redacted outer MCP request and response previews.
 - **Tool descriptions are from ida-mcp-rs.** Call `ida_tools_list` for upstream descriptions and parameter schemas, then call the selected upstream tool through `ida_tool`.
 - **No changes to ida-mcp-rs needed.** This integration uses ida-mcp-rs's standard MCP interface (stdio or HTTP) — no patches or forks required.
 
@@ -435,7 +448,7 @@ IDA is exposed through three MCP meta-tools rather than one registration per ups
 |------|-------------|
 | `ida_tools_list` | Lazily obtain the available ida-mcp-rs tool catalog, descriptions, and parameter schemas. It does not open an IDB. |
 | `ida_tool` | Invoke an upstream IDA operation by `name`. `open_idb`/`open_dsc` returns an `analysis_id`; pass it for later operations and for `close_idb`. |
-| `ida_status` | Show capacity, active handles, currently opening analyses, and catalog-cache state without starting a worker. |
+| `ida_status` | Show capacity, openings, active handles, worker connection details, current operations and their elapsed time, and the last completed operation without querying or starting a worker. |
 
 ### Key Behaviors
 
@@ -573,6 +586,7 @@ Then reference mounted files using the subdirectory path:
 | "Invalid file path" | Path traversal or special chars | Use simple relative paths without `..` |
 | "Invalid file path" (with `--sandbox`) | Path outside samples/output dirs | Use a relative path or remove `--sandbox` |
 | "Command timed out" | Tool took too long | Increase `--timeout` value |
+| `ida_tool` sent no response or progress for 300s | IDA operation exceeded the MCP client's idle timeout | Check `ida_status`; use a progress-capable client, or raise/set `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT=0`. This is separate from `--ida-timeout` |
 | "[Truncated at ...]" | Output exceeded per-tool budget | Full output saved to output dir, use `download_file` to retrieve |
 
 ### Debug Tips

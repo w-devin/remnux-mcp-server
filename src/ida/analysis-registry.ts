@@ -9,12 +9,46 @@ export interface IdaCallResult {
   isError?: boolean;
 }
 
+export interface IdaOperationSummary {
+  operation_id: string;
+  tool: string;
+  status: "running" | "succeeded" | "tool_error" | "failed";
+  started_at: string;
+  elapsed_ms: number;
+  argument_keys: string[];
+  completed_at?: string;
+  error?: string;
+}
+
+export interface IdaConnectorStatus {
+  mode: "stdio" | "http" | "unknown";
+  connected: boolean;
+  connecting: boolean;
+  child_pid?: number;
+  connect_attempts?: number;
+  last_close_at?: string;
+  last_close_reason?: string;
+}
+
+export interface IdaOpeningSummary {
+  opening_id: string;
+  tool: string;
+  sample?: string;
+  started_at: string;
+  elapsed_ms: number;
+  argument_keys: string[];
+}
+
 export interface IdaAnalysisSummary {
   analysis_id: string;
   opened_with: string;
   sample?: string;
   created_at: string;
   last_used_at: string;
+  state: "idle" | "busy";
+  worker: IdaConnectorStatus;
+  current_operations: IdaOperationSummary[];
+  last_operation?: IdaOperationSummary;
 }
 
 export interface IdaAnalysisConnector {
@@ -24,6 +58,7 @@ export interface IdaAnalysisConnector {
     args: Record<string, unknown>,
   ): Promise<{ content: IdaCallResult["content"]; isError?: boolean }>;
   disconnect(): Promise<void>;
+  getStatus?(): IdaConnectorStatus;
 }
 
 export type IdaConnectorFactory = (config: IdaConnectorConfig) => IdaAnalysisConnector;
@@ -34,6 +69,26 @@ interface IdaAnalysis {
   sample?: string;
   createdAt: number;
   lastUsedAt: number;
+  operations: Map<string, IdaTrackedOperation>;
+  lastOperation?: IdaTrackedOperation;
+}
+
+interface IdaOpening {
+  openingId: string;
+  tool: string;
+  sample?: string;
+  startedAt: number;
+  argumentKeys: string[];
+}
+
+interface IdaTrackedOperation {
+  operationId: string;
+  tool: string;
+  startedAt: number;
+  argumentKeys: string[];
+  status: IdaOperationSummary["status"];
+  completedAt?: number;
+  error?: string;
 }
 
 /**
@@ -46,7 +101,7 @@ interface IdaAnalysis {
  */
 export class IdaAnalysisRegistry {
   private readonly analyses = new Map<string, IdaAnalysis>();
-  private creating = 0;
+  private readonly openings = new Map<string, IdaOpening>();
   private toolCatalog: IdaToolMeta[] | null = null;
 
   constructor(
@@ -64,7 +119,7 @@ export class IdaAnalysisRegistry {
   }
 
   get creatingCount(): number {
-    return this.creating;
+    return this.openings.size;
   }
 
   get capacity(): number {
@@ -73,6 +128,17 @@ export class IdaAnalysisRegistry {
 
   get cachedToolCount(): number | undefined {
     return this.toolCatalog?.length;
+  }
+
+  listOpenings(): IdaOpeningSummary[] {
+    return [...this.openings.values()].map((opening) => ({
+      opening_id: opening.openingId,
+      tool: opening.tool,
+      ...(opening.sample ? { sample: opening.sample } : {}),
+      started_at: new Date(opening.startedAt).toISOString(),
+      elapsed_ms: Date.now() - opening.startedAt,
+      argument_keys: opening.argumentKeys,
+    }));
   }
 
   listAnalyses(): IdaAnalysisSummary[] {
@@ -176,14 +242,25 @@ export class IdaAnalysisRegistry {
     name: string,
     args: Record<string, unknown>,
   ): Promise<IdaCallResult> {
-    if (this.analyses.size + this.creating >= this.maxConcurrentAnalyses) {
+    if (this.analyses.size + this.openings.size >= this.maxConcurrentAnalyses) {
       throw new Error(
         `IDA analysis capacity reached (${this.analyses.size}/${this.maxConcurrentAnalyses} active; ` +
-        `${this.creating} opening). Close an existing analysis or retry later.`,
+        `${this.openings.size} opening). Close an existing analysis or retry later.`,
       );
     }
 
-    this.creating++;
+    const opening: IdaOpening = {
+      openingId: randomUUID().slice(0, 8),
+      tool: name,
+      sample: extractSample(args),
+      startedAt: Date.now(),
+      argumentKeys: Object.keys(args),
+    };
+    this.openings.set(opening.openingId, opening);
+    remnuxLog(
+      `IDA analysis opening opening=${opening.openingId} tool=${name} ` +
+      `sample=${opening.sample ?? "-"} opening_count=${this.openings.size}`,
+    );
     let analysisId: string | undefined;
     let closedUnexpectedly = false;
     const connector = this.connectorFactory({
@@ -218,6 +295,7 @@ export class IdaAnalysisRegistry {
         sample: extractSample(args),
         createdAt: now,
         lastUsedAt: now,
+        operations: new Map(),
       });
       remnuxLog(
         `IDA analysis created analysis=${analysisId} active=${this.analyses.size}/${this.maxConcurrentAnalyses}`,
@@ -227,7 +305,11 @@ export class IdaAnalysisRegistry {
       await connector.disconnect();
       throw error;
     } finally {
-      this.creating--;
+      this.openings.delete(opening.openingId);
+      remnuxLog(
+        `IDA analysis opening finished opening=${opening.openingId} tool=${name} ` +
+        `elapsed_ms=${Date.now() - opening.startedAt} opening_count=${this.openings.size}`,
+      );
     }
   }
 
@@ -237,13 +319,39 @@ export class IdaAnalysisRegistry {
     name: string,
     args: Record<string, unknown>,
   ): Promise<{ content: IdaCallResult["content"]; isError?: boolean }> {
+    const operation: IdaTrackedOperation = {
+      operationId: randomUUID().slice(0, 8),
+      tool: name,
+      startedAt: Date.now(),
+      argumentKeys: Object.keys(args),
+      status: "running",
+    };
+    analysis.operations.set(operation.operationId, operation);
+    remnuxLog(
+      `IDA operation started operation=${operation.operationId} analysis=${analysisId} ` +
+      `tool=${name} active_operations=${analysis.operations.size}`,
+    );
+
     try {
-      return await analysis.connector.callTool(name, args);
+      const result = await analysis.connector.callTool(name, args);
+      operation.status = result.isError ? "tool_error" : "succeeded";
+      return result;
     } catch (error) {
+      operation.status = "failed";
+      operation.error = describeError(error);
       if (shouldReleaseAfterError(error)) {
         await this.release(analysisId);
       }
       throw error;
+    } finally {
+      operation.completedAt = Date.now();
+      analysis.operations.delete(operation.operationId);
+      analysis.lastOperation = operation;
+      remnuxLog(
+        `IDA operation finished operation=${operation.operationId} analysis=${analysisId} ` +
+        `tool=${name} status=${operation.status} elapsed_ms=${operation.completedAt - operation.startedAt} ` +
+        `active_operations=${analysis.operations.size}`,
+      );
     }
   }
 
@@ -277,6 +385,14 @@ export class IdaAnalysisRegistry {
       ...(analysis.sample ? { sample: analysis.sample } : {}),
       created_at: new Date(analysis.createdAt).toISOString(),
       last_used_at: new Date(analysis.lastUsedAt).toISOString(),
+      state: analysis.operations.size > 0 ? "busy" : "idle",
+      worker: analysis.connector.getStatus?.() ?? {
+        mode: "unknown",
+        connected: true,
+        connecting: false,
+      },
+      current_operations: [...analysis.operations.values()].map(toOperationSummary),
+      ...(analysis.lastOperation ? { last_operation: toOperationSummary(analysis.lastOperation) } : {}),
     };
   }
 }
@@ -296,4 +412,22 @@ function extractSample(args: Record<string, unknown>): string | undefined {
     if (typeof value === "string" && value) return value;
   }
   return undefined;
+}
+
+function toOperationSummary(operation: IdaTrackedOperation): IdaOperationSummary {
+  const end = operation.completedAt ?? Date.now();
+  return {
+    operation_id: operation.operationId,
+    tool: operation.tool,
+    status: operation.status,
+    started_at: new Date(operation.startedAt).toISOString(),
+    elapsed_ms: end - operation.startedAt,
+    argument_keys: operation.argumentKeys,
+    ...(operation.completedAt ? { completed_at: new Date(operation.completedAt).toISOString() } : {}),
+    ...(operation.error ? { error: operation.error } : {}),
+  };
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

@@ -122,6 +122,9 @@ describe("IdaAnalysisRegistry", () => {
 
     const opening = registry.callTool(undefined, "open_idb", { path: "/samples/first.exe" });
     await Promise.resolve();
+    expect(registry.listOpenings()).toEqual([
+      expect.objectContaining({ tool: "open_idb", sample: "/samples/first.exe" }),
+    ]);
     await expect(registry.callTool(undefined, "open_idb", { path: "/samples/second.exe" }))
       .rejects.toThrow("capacity reached");
 
@@ -164,4 +167,77 @@ describe("IdaAnalysisRegistry", () => {
     await expect(registry.callTool(opened.analysisId, "decompile", { addr: "0x401000" }))
       .rejects.toThrow("analysis context not found");
   });
+
+  it("reports a blocked upstream call as busy without querying the worker", async () => {
+    let releaseCall!: () => void;
+    const callGate = new Promise<void>((resolve) => { releaseCall = resolve; });
+    const connectors: FakeConnector[] = [];
+    const registry = new IdaAnalysisRegistry(
+      CONNECTOR_CONFIG,
+      1,
+      (config) => {
+        const connector = new FakeConnector(config);
+        const original = connector.callTool.bind(connector);
+        connector.callTool = async (name, args) => {
+          if (name === "analyze_funcs") await callGate;
+          return original(name, args);
+        };
+        connectors.push(connector);
+        return connector;
+      },
+    );
+    const opened = await registry.callTool(undefined, "open_idb", { path: "/samples/one.exe" });
+
+    const running = registry.callTool(opened.analysisId, "analyze_funcs", { background: true });
+    await Promise.resolve();
+
+    const status = registry.inspect(opened.analysisId!);
+    expect(status.state).toBe("busy");
+    expect(status.current_operations).toEqual([
+      expect.objectContaining({ tool: "analyze_funcs", status: "running" }),
+    ]);
+    expect(connectors[0].calls.map((call) => call.name)).toEqual(["open_idb"]);
+
+    releaseCall();
+    await running;
+    const completed = registry.inspect(opened.analysisId!);
+    expect(completed.state).toBe("idle");
+    expect(completed.current_operations).toEqual([]);
+    expect(completed.last_operation).toEqual(
+      expect.objectContaining({ tool: "analyze_funcs", status: "succeeded" }),
+    );
+  });
+
+
+  it("clears busy state and records a failed operation when an upstream call throws", async () => {
+    const connectors: FakeConnector[] = [];
+    const registry = new IdaAnalysisRegistry(
+      CONNECTOR_CONFIG,
+      1,
+      (config) => {
+        const connector = new FakeConnector(config);
+        const original = connector.callTool.bind(connector);
+        connector.callTool = async (name, args) => {
+          if (name === "decompile") throw new Error("IDA analysis failed");
+          return original(name, args);
+        };
+        connectors.push(connector);
+        return connector;
+      },
+    );
+    const opened = await registry.callTool(undefined, "open_idb", { path: "/samples/one.exe" });
+
+    await expect(registry.callTool(opened.analysisId, "decompile", { addr: "0x401000" }))
+      .rejects.toThrow("IDA analysis failed");
+
+    const status = registry.inspect(opened.analysisId!);
+    expect(status.state).toBe("idle");
+    expect(status.current_operations).toEqual([]);
+    expect(status.last_operation).toEqual(expect.objectContaining({
+      tool: "decompile",
+      status: "failed",
+      error: "IDA analysis failed",
+    }));
+  });
+
 });
